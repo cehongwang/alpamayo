@@ -26,8 +26,14 @@ uv venv ar1_venv
 source ar1_venv/bin/activate
 uv sync --active
 ```
-
-### 3. Authenticate with HuggingFace
+### 3. Setting up Torch-TensorRT
+Alpamayo is using torch 2.8.0 so we should build Torch-TensorRT under that Torch version.
+1. Set up the environment of Alpamayo as described above
+2. Install bazel and other Torch-TensorRT dependencies
+3. Change the setup.py in the Torch-TensorRT repo to allow the version of torch 2.8.0. Change MODULE.bazel to point to `"/home/alpamayo/ar1_venv/lib/python3.12/site-packages/torch"` as a `new_local_repository` at line 160 and delete original libtorch at line 63.
+4. [important!] run python setup.clean on Torch-TensorRT repo to clear existing build and pip uninstall torch_tensorrt
+5. run `uv pip install --pre -e . --extra-index-url https://download.pytorch.org/whl/cu128`.
+### 4. Authenticate with HuggingFace
 
 The model requires access to gated resources. Request access here:
 - 🤗 [Physical AI AV Dataset](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles)
@@ -40,6 +46,8 @@ hf auth login
 ```
 
 Get your token at: https://huggingface.co/settings/tokens
+
+
 
 ## Running Inference
 
