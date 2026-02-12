@@ -34,3 +34,6 @@ By uncomment the `compile_qwen3vl_language_model`, you can initialize the langua
 
 ### 3. Compile the Diffusion Model
 By uncomment the `compile_diffusion`, you can initialize the diffusion part compilation. 
+
+- Model compilation: ✓ Fails on 2.8.0 
+- Accuracy: ✖ Max diff: ~1.0
