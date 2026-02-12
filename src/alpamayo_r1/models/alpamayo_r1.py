@@ -161,7 +161,8 @@ class AlpamayoR1(ReasoningVLA):
         }
         input_ids = self.fuse_traj_tokens(input_ids, traj_data_vlm)
         device = input_ids.device
-
+        use_cache = kwargs.get("use_cache", True)
+        cache_implementation = kwargs.get("cache_implementation", "static")
         # 1) run autoregressive generation for the VLM
         max_generation_length = kwargs.get(
             "max_generation_length", self.config.tokens_per_future_traj
@@ -194,6 +195,8 @@ class AlpamayoR1(ReasoningVLA):
             generation_config=generation_config,
             stopping_criteria=stopping_criteria,
             logits_processor=logits_processor,
+            use_cache=use_cache,
+            cache_implementation=cache_implementation,
             **tokenized_data,
         )
         vlm_outputs.rope_deltas = self.vlm.model.rope_deltas

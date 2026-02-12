@@ -2,28 +2,149 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 import torch_tensorrt
-import numpy as np
-import argparse
-from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
-from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
-from alpamayo_r1 import helper
-from alpamayo_r1 import register_sdpa
-import inspect
 from alpamayo_r1.diffusion.flow_matching import FlowMatching
-from transformers.cache_utils import DynamicCache
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionAttention,
     apply_rotary_pos_emb_vision,
     eager_attention_forward,
 )
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# 1 Compile model.vlm.model.visual
+
+
+def check_output_equal(
+    output1,
+    output2,
+    rtol=0.05,
+    atol=0.05,
+) -> bool:
+    if type(output1) != type(output2):
+        logger.warning(
+            "The output types are different. Check_output_equal will always return false."
+        )
+        return False
+
+    if isinstance(output1, torch.Tensor):
+        if output1.shape != output2.shape:
+            return False
+        if torch.allclose(output1, output2, rtol, atol):  # type: ignore
+            return True
+        else:
+            print(f"Output {output1} and {output2} are not close. Max diff: {torch.max(torch.abs(output1 - output2))}, Mean diff: {torch.mean(torch.abs(output1 - output2))}")
+            return False
+    
+    elif isinstance(output1, (tuple, list)):
+        if len(output1) != len(output2):
+            return False
+        for a, b in zip(output1, output2):
+            if not check_output_equal(a, b, rtol, atol):
+                return False
+            return True
+
+    elif isinstance(output1, dict):
+        if output1.keys() != output2.keys():
+            return False
+        for a, b in zip(output1.values(), output2.values()):
+            if not check_output_equal(a, b, rtol, atol):
+                return False
+        return True
+
+    logger.warning(
+        "The output type is not supported to be checked. Check_output_equal will always return false."
+    )
+    return False
+
+
+def plot_error_histogram(
+    torch_output,
+    trt_output,
+    save_path: str = "error_histogram.png",
+    bins: int = 100,
+    log_scale: bool = True,
+):
+    """
+    Draw histograms of the element-wise absolute error between torch_output
+    and trt_output.  Supports torch.Tensor, list/tuple of tensors, or
+    dict of tensors (recursively).
+
+    Args:
+        torch_output: output from the PyTorch model (Tensor | list | tuple | dict)
+        trt_output:   output from the TensorRT model (same structure)
+        save_path:    where to save the figure
+        bins:         number of histogram bins
+        log_scale:    if True, use log scale on the y-axis
+    """
+
+    def _flatten_tensors(out, prefix=""):
+        """Recursively flatten an output structure into a list of (name, tensor) pairs."""
+        results = []
+        if isinstance(out, torch.Tensor):
+            results.append((prefix or "tensor", out))
+        elif isinstance(out, dict):
+            for key, val in out.items():
+                results.extend(_flatten_tensors(val, prefix=f"{prefix}.{key}" if prefix else str(key)))
+        elif isinstance(out, (list, tuple)):
+            for i, val in enumerate(out):
+                results.extend(_flatten_tensors(val, prefix=f"{prefix}[{i}]"))
+        return results
+
+    flat_torch = _flatten_tensors(torch_output, prefix="torch")
+    flat_trt = _flatten_tensors(trt_output, prefix="trt")
+
+    if len(flat_torch) != len(flat_trt):
+        logger.warning(
+            f"plot_error_histogram: torch output has {len(flat_torch)} tensors "
+            f"but trt output has {len(flat_trt)} tensors. "
+            f"Comparing the first {min(len(flat_torch), len(flat_trt))} pairs."
+        )
+
+    error_pairs = []
+    for (torch_name, t_tensor), (trt_name, trt_tensor) in zip(flat_torch, flat_trt):
+        diff = (t_tensor.float() - trt_tensor.float()).abs().detach().cpu().numpy().ravel()
+        label = torch_name.removeprefix("torch")  # e.g. "[0]", ".last_hidden_state"
+        error_pairs.append((label or "output", diff))
+
+    if not error_pairs:
+        logger.warning("plot_error_histogram: no tensor pairs found to compare.")
+        return
+
+    n = len(error_pairs)
+    fig, axes = plt.subplots(n, 1, figsize=(10, 4 * n), squeeze=False)
+
+    for idx, (name, diff) in enumerate(error_pairs):
+        ax = axes[idx, 0]
+        ax.hist(diff, bins=bins, edgecolor="black", alpha=0.75)
+        if log_scale:
+            ax.set_yscale("log")
+        ax.set_xlabel("Absolute Error")
+        ax.set_ylabel("Count")
+        ax.set_title(
+            f"{name}  |  max={diff.max():.6e}  mean={diff.mean():.6e}  "
+            f"median={np.median(diff):.6e}"
+        )
+        ax.axvline(diff.mean(), color="red", linestyle="--", label="mean")
+        ax.axvline(np.median(diff), color="orange", linestyle="--", label="median")
+        ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    logger.info(f"Error histogram saved to {save_path}")
+
+
+# ====================================================================================================
+# 1. Compile model.vlm.model.visual
+# ====================================================================================================
+
 _orig_qwen3vl_attn_forward = Qwen3VLVisionAttention.forward
 
 def _qwen3vl_attn_forward_static_lengths(
@@ -145,7 +266,7 @@ class VisualFixedGrid(torch.nn.Module):
         return hidden_states, deepstack_feature_lists
 
 
-def compile_qwen3vl_visual(model, model_inputs):
+def compile_qwen3vl_visual(model, model_inputs, plot=False):
     """
     Compile the Qwen3VLVisionModel.
     Args:
@@ -170,6 +291,7 @@ def compile_qwen3vl_visual(model, model_inputs):
         "use_explicit_typing": False,
         "enabled_precisions": {torch.bfloat16},
         "dryrun": False,
+        # "use_fp32_acc": True,
         # "require_full_compilation": True,
     }
 
@@ -207,12 +329,23 @@ def compile_qwen3vl_visual(model, model_inputs):
     )
 
     logger.info("Qwen3VLVisionModel was successfully compiled")
+
+    torch_output = wrap(*inputs)
+    trt_output = trt_model(*inputs)
+    if check_output_equal(torch_output, trt_output, 0.05, 0.05):
+        print("compile_qwen3vl_visual output is correct")
+    else:
+        print("compile_qwen3vl_visual output is incorrect")
+
+    if plot:
+        plot_error_histogram(torch_output, trt_output, save_path="visual_error_histogram.png")
+
     return trt_model
 
 
-
-
-# 2 Compile model.vlm.model.language_model
+# ====================================================================================================
+# 2. Compile model.vlm.model.language_model
+# ====================================================================================================
 class LMCompiledWrapper(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
@@ -230,22 +363,25 @@ class LMCompiledWrapper(torch.nn.Module):
         deepstack_visual_embeds=None,
         **kwargs,
     ):
+        # TODO: Need to add cache arguments to the model forward pass if using KV cache
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            position_ids=None,
-            past_key_values=None,
+            position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            # TODO: Enable KV cache
+            past_key_values=None,
             cache_position=None,
+            # cache_implementation="static",
             # args for deepstack
-            visual_pos_masks=None,
-            deepstack_visual_embeds=None,
-            cache_implementation="static",
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
         )
-        return outputs.last_hidden_state
 
-def compile_qwen3vl_language_model(model, model_inputs):
+        return outputs
+
+def compile_qwen3vl_language_model(model, model_inputs, use_cache=False, cache_implementation="static", plot=False):
     """
     Compile the Qwen3VLTextModel.
     Args:
@@ -264,8 +400,9 @@ def compile_qwen3vl_language_model(model, model_inputs):
         "use_python_runtime": True,
         "immutable_weights": True,
         "offload_module_to_cpu": False,
-        "use_explicit_typing": False,
-        "enabled_precisions": {torch.bfloat16},
+        # "enabled_precisions": {torch.bfloat16},
+        "use_explicit_typing": True,
+        "use_fp32_acc": True,
         "dryrun": False,
     }
     device = torch.device("cuda:0")
@@ -277,7 +414,8 @@ def compile_qwen3vl_language_model(model, model_inputs):
 
     
     input_ids = None  # model_inputs["tokenized_data"]["input_ids"]
-    attention_mask = model_inputs["tokenized_data"]["attention_mask"].to(dtype=torch.bool, device=device)
+    dtype = torch.bool if use_cache and cache_implementation == "static" else torch.int64
+    attention_mask = model_inputs["tokenized_data"]["attention_mask"].to(dtype=dtype, device=device)
     # Qwen3VL passes position_ids shaped (3, B, S)
     # position_ids = torch.arange(S, device=device, dtype=torch.long).view(1, -1).expand(B, -1)
     # position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
@@ -320,6 +458,7 @@ def compile_qwen3vl_language_model(model, model_inputs):
 
     lm_wrapper = LMCompiledWrapper(model).to(device).eval()
 
+    # For Torch >= 2.9.0, use the following code
     # try:
     #     logger.info("Trying to export the model using torch.export.export()..")
     #     ep = torch.export.export(
@@ -355,7 +494,7 @@ def compile_qwen3vl_language_model(model, model_inputs):
             inputs,
             dynamic_shapes=dynamic_shapes,
             strict=False,
-            prefer_deferred_runtime_asserts_over_guards=True,
+            allow_complex_guards_as_runtime_asserts=True,
         )
 
     trt_lm = torch_tensorrt.dynamo.compile(
@@ -374,19 +513,18 @@ def compile_qwen3vl_language_model(model, model_inputs):
     #     logger.info(f"trt_out[0].shape: {trt_out[0].shape}")
     
     print("Lm model was successfully compiled!!!!!!!!!!!!!!!")
-    # start_idx = torch.tensor(0, device=device)
-    # end_idx = torch.tensor(S, device=device)  # insert at position 0
-    # with torch_tensorrt.dynamo.Debugger():
-    #     trt_out = trt_lm(input_ids, attention_mask, position_ids, past_key_values, inputs_embeds, use_cache, cache_position, visual_pos_masks, deepstack_visual_embeds)
-    #     logger.info(f"compile_qwen3vl_language_model trt_out:\n{trt_out}")
-    #     logger.info(f"trt_out[0].shape: {trt_out[0].shape}")
-        
-        # fix inputs start_idx and end_idx for the function trt_lm
-        # from functools import partial
-        # trt_lm = partial(trt_lm, start_idx=start_idx, end_idx=end_idx)
-        
-        # torch_out = model(input_ids, attention_mask, position_ids, past_key_values, inputs_embeds, use_cache=use_cache, cache_position=cache_position, visual_pos_masks=visual_pos_masks, deepstack_visual_embeds=deepstack_visual_embeds)
-        # print("compile_qwen3vl_language_model torch_out:\n", torch_out)
+    torch_output = lm_wrapper(*inputs)
+    trt_output = trt_lm(*inputs)
+    if check_output_equal(torch_output, trt_output, 0.05, 0.05):
+        print("compile_qwen3vl_language_model output is correct")
+    else:
+        print("compile_qwen3vl_language_model output is incorrect")
+
+    if plot:
+        plot_error_histogram(torch_output, trt_output, save_path="language_error_histogram.png")
+
+
+
     return trt_lm
 
 
@@ -491,9 +629,10 @@ def compile_qwen3vl_language_model(model, model_inputs):
 #     return trt_expert
 
 
-
-
+# ====================================================================================================
 # 3. Compile model.diffusion
+# ====================================================================================================
+
 class FlowMatchingTRTWrapper(torch.nn.Module):
     def __init__(self, flow: FlowMatching, step_fn: torch.nn.Module, inference_steps: int = 10):
         super().__init__()
