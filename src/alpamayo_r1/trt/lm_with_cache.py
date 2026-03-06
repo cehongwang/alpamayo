@@ -210,6 +210,193 @@ class Qwen3VLTextModelWithCacheWrapper(nn.Module):
         return hidden_states, cache
 
 
+class Qwen3VLTextModelPrefillWrapper(nn.Module):
+    """
+    Prefill-only wrapper for TRT export.
+
+    I/O:
+      (attention_mask, position_ids, inputs_embeds) -> (hidden_states, updated_k, updated_v)
+    """
+
+    def __init__(
+        self,
+        cache_wrapper: Qwen3VLTextModelWithCacheWrapper,
+        *,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ):
+        super().__init__()
+        self.cache_wrapper = cache_wrapper
+        self.num_layers = int(num_layers)
+        self.num_kv_heads = int(num_kv_heads)
+        self.head_dim = int(head_dim)
+
+    @staticmethod
+    def _apply_dense_deepstack(
+        hidden_states: torch.Tensor,
+        deepstack_layer_embeds: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if deepstack_layer_embeds is None:
+            return hidden_states
+        return hidden_states + deepstack_layer_embeds.to(hidden_states.device, hidden_states.dtype)
+
+    def forward(
+        self,
+        attention_mask: torch.Tensor,
+        position_ids: torch.LongTensor,
+        inputs_embeds: torch.FloatTensor,
+        visual_pos_masks: torch.Tensor | None = None,
+        deepstack_visual_embeds: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...] | None = None,
+    ):
+        language_model = self.cache_wrapper.language_model
+        bsz = inputs_embeds.shape[0]
+        cache = PrefixKVCache.empty(
+            num_layers=self.num_layers,
+            batch_size=bsz,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            dtype=inputs_embeds.dtype,
+            device=inputs_embeds.device,
+        )
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+        text_position_ids = position_ids[0]
+
+        q_len = inputs_embeds.shape[1]
+        if (
+            attention_mask is not None
+            and attention_mask.ndim == 4
+            and attention_mask.shape[-2] == q_len
+        ):
+            expected_kv = cache.get_seq_length() + q_len
+            if attention_mask.shape[-1] != expected_kv:
+                if attention_mask.shape[-1] > expected_kv:
+                    attention_mask = attention_mask[..., -expected_kv:]
+                else:
+                    pad = torch.zeros(
+                        attention_mask.shape[0],
+                        attention_mask.shape[1],
+                        attention_mask.shape[2],
+                        expected_kv - attention_mask.shape[-1],
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device,
+                    )
+                    attention_mask = torch.cat([pad, attention_mask], dim=-1)
+            causal_mask = attention_mask.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        else:
+            causal_mask = Qwen3VLTextModelWithCacheWrapper._build_causal_mask(
+                batch_size=bsz,
+                q_len=q_len,
+                prefix_len=0,
+                attention_mask=attention_mask,
+                device=inputs_embeds.device,
+                dtype=inputs_embeds.dtype,
+            )
+
+        if isinstance(deepstack_visual_embeds, (list, tuple)) and len(deepstack_visual_embeds) > 0:
+            deepstack_visual_embeds = torch.stack(
+                [d.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype) for d in deepstack_visual_embeds],
+                dim=0,
+            )
+
+        hidden_states = inputs_embeds
+        position_embeddings = language_model.rotary_emb(hidden_states, position_ids)
+        for layer_idx, decoder_layer in enumerate(language_model.layers):
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=text_position_ids,
+                past_key_values=cache,
+                cache_position=None,
+                position_embeddings=position_embeddings,
+            )
+            layer_embed = None
+            if isinstance(deepstack_visual_embeds, torch.Tensor):
+                if deepstack_visual_embeds.ndim == 4 and layer_idx < deepstack_visual_embeds.shape[0]:
+                    layer_embed = deepstack_visual_embeds[layer_idx]
+                elif (
+                    deepstack_visual_embeds.ndim == 3
+                    and visual_pos_masks is not None
+                    and layer_idx < deepstack_visual_embeds.shape[0]
+                ):
+                    mask3d = visual_pos_masks.to(device=inputs_embeds.device, dtype=torch.bool).unsqueeze(-1).expand(
+                        bsz, q_len, inputs_embeds.shape[-1]
+                    )
+                    layer_embed = torch.zeros_like(hidden_states).masked_scatter(
+                        mask3d, deepstack_visual_embeds[layer_idx].reshape(-1)
+                    )
+            hidden_states = self._apply_dense_deepstack(hidden_states, layer_embed)
+
+        hidden_states = language_model.norm(hidden_states)
+        updated_k, updated_v = cache.get_updated_stacked()
+        return hidden_states, updated_k, updated_v
+
+
+class Qwen3VLPrefillRuntimeAdapter(nn.Module):
+    """
+    Runtime adapter that lets prefill accept visual/deepstack args while using
+    the compiled TRT prefill engine underneath.
+    """
+
+    def __init__(self, prefill_impl: nn.Module, num_deepstack: int):
+        super().__init__()
+        self.prefill_impl = prefill_impl
+        self.num_deepstack = int(num_deepstack)
+
+    def forward(
+        self,
+        attention_mask: torch.Tensor,
+        position_ids: torch.LongTensor,
+        inputs_embeds: torch.FloatTensor,
+        visual_pos_masks: torch.Tensor | None = None,
+        deepstack_visual_embeds: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...] | None = None,
+    ):
+        bsz, q_len, hidden_size = inputs_embeds.shape
+        if visual_pos_masks is None:
+            visual_pos_masks = torch.zeros(
+                bsz,
+                q_len,
+                dtype=torch.bool,
+                device=inputs_embeds.device,
+            )
+        else:
+            visual_pos_masks = visual_pos_masks.to(device=inputs_embeds.device, dtype=torch.bool)
+
+        dense_deepstack = inputs_embeds.new_zeros((self.num_deepstack, bsz, q_len, hidden_size))
+        mask3d = visual_pos_masks.unsqueeze(-1).expand(bsz, q_len, hidden_size)
+        if isinstance(deepstack_visual_embeds, (list, tuple)):
+            for idx, layer_embeds in enumerate(deepstack_visual_embeds[: self.num_deepstack]):
+                layer_embeds = layer_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+                if layer_embeds.numel() > 0:
+                    dense_deepstack[idx] = dense_deepstack[idx].masked_scatter(mask3d, layer_embeds.reshape(-1))
+        elif isinstance(deepstack_visual_embeds, torch.Tensor):
+            if deepstack_visual_embeds.ndim == 4:
+                dense_deepstack = deepstack_visual_embeds.to(
+                    device=inputs_embeds.device,
+                    dtype=inputs_embeds.dtype,
+                )
+            elif deepstack_visual_embeds.ndim == 3:
+                for idx in range(min(self.num_deepstack, deepstack_visual_embeds.shape[0])):
+                    layer_embeds = deepstack_visual_embeds[idx].to(
+                        device=inputs_embeds.device,
+                        dtype=inputs_embeds.dtype,
+                    )
+                    if layer_embeds.numel() > 0:
+                        dense_deepstack[idx] = dense_deepstack[idx].masked_scatter(
+                            mask3d,
+                            layer_embeds.reshape(-1),
+                        )
+
+        return self.prefill_impl(
+            attention_mask,
+            position_ids,
+            inputs_embeds,
+            visual_pos_masks,
+            dense_deepstack,
+        )
+
+
 def _normalize_attention_mask_for_wrapper(
     attention_mask: torch.Tensor | dict | None,
     batch_size: int,
@@ -323,6 +510,64 @@ def _export_wrapper(
     return ep
 
 
+def _export_prefill_wrapper(
+    wrapper: nn.Module,
+    example_attention_mask: torch.Tensor,
+    example_position_ids: torch.Tensor,
+    example_embeds: torch.Tensor,
+    example_visual_pos_masks: torch.Tensor,
+    example_deepstack_visual_embeds: torch.Tensor,
+    max_batch_size: int,
+    max_seq_len: int,
+) -> "torch.export.ExportedProgram":
+    import transformers.integrations.sdpa_attention as _sdpa_mod
+
+    orig_use_gqa = _sdpa_mod.use_gqa_in_sdpa
+    _sdpa_mod.use_gqa_in_sdpa = lambda *args, **kwargs: False
+
+    batch_dim = torch.export.Dim("batch", min=1, max=max_batch_size)
+    seq_dim = torch.export.Dim("seq_len", min=1, max=max_seq_len)
+    dynamic_shapes = {
+        "attention_mask": {0: batch_dim, 1: seq_dim},
+        "position_ids": {1: batch_dim, 2: seq_dim},
+        "inputs_embeds": {0: batch_dim, 1: seq_dim},
+        "visual_pos_masks": {0: batch_dim, 1: seq_dim},
+        "deepstack_visual_embeds": {1: batch_dim, 2: seq_dim},
+    }
+
+    try:
+        with torch.no_grad():
+            kwargs = dict(
+                attention_mask=example_attention_mask,
+                position_ids=example_position_ids,
+                inputs_embeds=example_embeds,
+                visual_pos_masks=example_visual_pos_masks,
+                deepstack_visual_embeds=example_deepstack_visual_embeds,
+            )
+            try:
+                ep = torch.export.export(
+                    wrapper,
+                    args=(),
+                    kwargs=kwargs,
+                    dynamic_shapes=dynamic_shapes,
+                    strict=False,
+                )
+            except Exception as e:
+                logger.warning("torch.export.export (prefill) failed (%s); trying trace fallback", e)
+                ep = torch.export._trace._export(
+                    wrapper,
+                    args=(),
+                    kwargs=kwargs,
+                    dynamic_shapes=dynamic_shapes,
+                    strict=False,
+                    prefer_deferred_runtime_asserts_over_guards=True,
+                )
+    finally:
+        _sdpa_mod.use_gqa_in_sdpa = orig_use_gqa
+
+    return ep
+
+
 def _fix_requires_output_allocator(trt_backbone: nn.Module) -> None:
     try:
         from torch_tensorrt.dynamo.runtime._PythonTorchTensorRTModule import (
@@ -344,6 +589,7 @@ def _fix_requires_output_allocator(trt_backbone: nn.Module) -> None:
 def _install_hf_generate_wrapper_adapter(
     model: nn.Module,
     wrapper: nn.Module,
+    prefill_wrapper: nn.Module | None = None,
     *,
     device: str,
     dtype: torch.dtype,
@@ -358,6 +604,7 @@ def _install_hf_generate_wrapper_adapter(
         language_model._wrapper_original_forward = language_model.forward
 
     language_model._wrapper_impl = wrapper
+    language_model._wrapper_prefill_impl = prefill_wrapper
     language_model._wrapper_dtype = dtype
     language_model._wrapper_device = wrapper_device
 
@@ -391,9 +638,96 @@ def _install_hf_generate_wrapper_adapter(
         if use_cache is False:
             return _call_original_forward()
 
-        # Preserve correctness for DeepStack visual-prefill path.
+        # Prefill path in HF generate often carries DeepStack args.
+        # Use dedicated TRT prefill engine that includes DeepStack fusion.
         if visual_pos_masks is not None or deepstack_visual_embeds is not None:
-            return _call_original_forward()
+            if self._wrapper_prefill_impl is None:
+                return _call_original_forward()
+
+            del kwargs
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+
+            inputs_embeds = _maybe_to(
+                inputs_embeds,
+                device=self._wrapper_device,
+                dtype=self._wrapper_dtype,
+            )
+            bsz, q_len = inputs_embeds.shape[:2]
+
+            # Prefill wrapper expects empty/None cache input.
+            if past_key_values is not None:
+                prefix_len = 0
+                if hasattr(past_key_values, "get_seq_length"):
+                    prefix_len = int(past_key_values.get_seq_length())
+                elif isinstance(past_key_values, tuple) and len(past_key_values) == 2 and past_key_values[0] is not None:
+                    prefix_len = int(past_key_values[0].shape[3])
+                if prefix_len > 0:
+                    return _call_original_forward()
+
+            if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
+                prefill_attention_mask = _maybe_to(attention_mask, device=self._wrapper_device)
+                cur_len = prefill_attention_mask.shape[1]
+                if cur_len > q_len:
+                    prefill_attention_mask = prefill_attention_mask[:, -q_len:]
+                elif cur_len < q_len:
+                    pad = torch.ones(
+                        bsz,
+                        q_len - cur_len,
+                        dtype=prefill_attention_mask.dtype,
+                        device=self._wrapper_device,
+                    )
+                    prefill_attention_mask = torch.cat([pad, prefill_attention_mask], dim=-1)
+            else:
+                prefill_attention_mask = _normalize_attention_mask_for_wrapper(
+                    attention_mask=attention_mask,
+                    batch_size=bsz,
+                    query_len=q_len,
+                    prefix_len=0,
+                    device=self._wrapper_device,
+                )
+
+            if cache_position is None:
+                cache_position = torch.arange(0, q_len, device=self._wrapper_device, dtype=torch.long)
+            elif cache_position.ndim == 0:
+                cache_position = cache_position.view(1)
+            if position_ids is None:
+                position_ids = cache_position.view(1, 1, -1).expand(3, bsz, -1).clone()
+            elif position_ids.ndim == 2:
+                position_ids = position_ids[None, ...].expand(3, bsz, -1).clone()
+            position_ids = _maybe_to(position_ids, device=self._wrapper_device).to(dtype=torch.long)
+            if visual_pos_masks is None:
+                visual_pos_masks = torch.zeros(
+                    bsz,
+                    q_len,
+                    dtype=torch.bool,
+                    device=self._wrapper_device,
+                )
+            else:
+                visual_pos_masks = _maybe_to(visual_pos_masks, device=self._wrapper_device).to(dtype=torch.bool)
+
+            with torch.no_grad():
+                wrapper_out = self._wrapper_prefill_impl(
+                    prefill_attention_mask,
+                    position_ids,
+                    inputs_embeds,
+                    visual_pos_masks=visual_pos_masks,
+                    deepstack_visual_embeds=deepstack_visual_embeds,
+                )
+
+            if not isinstance(wrapper_out, (tuple, list)) or len(wrapper_out) != 3:
+                raise ValueError(
+                    "Prefill wrapper is expected to return 3 outputs "
+                    "(hidden_states, updated_k, updated_v)"
+                )
+            hidden_states, updated_k, updated_v = wrapper_out
+            updated_prefix_cache = PrefixKVCache(updated_k, updated_v)
+            return BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=updated_prefix_cache,
+            )
 
         del kwargs
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -421,6 +755,9 @@ def _install_hf_generate_wrapper_adapter(
             device=self._wrapper_device,
             dtype=self._wrapper_dtype,
         )
+        # Keep both KV tensors explicitly aligned with the compiled TRT dtype.
+        prefix_k = _maybe_to(prefix_k, device=self._wrapper_device, dtype=self._wrapper_dtype).contiguous()
+        prefix_v = _maybe_to(prefix_v, device=self._wrapper_device, dtype=self._wrapper_dtype).contiguous()
         if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
             # Fast path for HF decode: keep 2D mask in its native integer/bool dtype.
             wrapper_attention_mask = _maybe_to(attention_mask, device=self._wrapper_device)
@@ -515,10 +852,11 @@ def compile_vlm_lm_trt_with_cache(
     logger.info("  batch_size: %d", batch_size)
     logger.info("  offload_module_to_cpu: %s", offload_module_to_cpu)
 
-    dtype = torch.bfloat16
+    dtype = torch.float16
 
     backbone = model.vlm.model
     language_model = backbone.language_model
+    embedding_fn = language_model.get_input_embeddings()
 
     hidden_size = language_model.config.hidden_size
     num_layers = language_model.config.num_hidden_layers
@@ -587,6 +925,75 @@ def compile_vlm_lm_trt_with_cache(
         )
     _fix_requires_output_allocator(trt_backbone)
 
+    prefill_wrapper = Qwen3VLTextModelPrefillWrapper(
+        wrapper,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+    ).to(device=device, dtype=dtype).eval()
+    num_deepstack = int(len(getattr(backbone.visual, "deepstack_visual_indexes", [])))
+    opt_visual_tokens = max(1, min(opt_seq_len, 64))
+    example_prefill_attention_mask = torch.ones(
+        bsz, opt_seq_len, dtype=torch.long, device=device
+    )
+    example_prefill_visual_pos_masks = torch.zeros(
+        bsz,
+        opt_seq_len,
+        dtype=torch.bool,
+        device=device,
+    )
+    example_prefill_visual_pos_masks[:, :opt_visual_tokens] = True
+    if num_deepstack > 0:
+        example_prefill_deepstack_visual_embeds = torch.zeros(
+            num_deepstack,
+            bsz,
+            opt_seq_len,
+            hidden_size,
+            dtype=dtype,
+            device=device,
+        )
+        example_prefill_deepstack_visual_embeds[:, :, :opt_visual_tokens, :] = torch.randn(
+            num_deepstack,
+            bsz,
+            opt_visual_tokens,
+            hidden_size,
+            dtype=dtype,
+            device=device,
+        )
+    else:
+        example_prefill_deepstack_visual_embeds = torch.zeros(
+            0,
+            bsz,
+            opt_seq_len,
+            hidden_size,
+            dtype=dtype,
+            device=device,
+        )
+    ep_prefill = _export_prefill_wrapper(
+        wrapper=prefill_wrapper,
+        example_attention_mask=example_prefill_attention_mask,
+        example_position_ids=example_position_ids,
+        example_embeds=example_embeds,
+        example_visual_pos_masks=example_prefill_visual_pos_masks,
+        example_deepstack_visual_embeds=example_prefill_deepstack_visual_embeds,
+        max_batch_size=bsz,
+        max_seq_len=max_seq_len,
+    )
+    with torch_tensorrt.dynamo.Debugger() if debug else nullcontext():
+        trt_settings["offload_module_to_cpu"] = offload_module_to_cpu
+        trt_prefill = torch_tensorrt.dynamo.compile(
+            ep_prefill,
+            inputs=[
+                example_prefill_attention_mask,
+                example_position_ids,
+                example_embeds,
+                example_prefill_visual_pos_masks,
+                example_prefill_deepstack_visual_embeds,
+            ],
+            **trt_settings,
+        )
+    _fix_requires_output_allocator(trt_prefill)
+
     check_len = min(max_seq_len, 64)
     check_prefix_len = min(max_prefix_len, 32)
     short_embeds = torch.randn(1, check_len, hidden_size, dtype=dtype, device=device)
@@ -617,14 +1024,23 @@ def compile_vlm_lm_trt_with_cache(
     except Exception as e:
         logger.warning("LM TRT smoke test failed: %s", e)
 
+    prefill_runtime_adapter = Qwen3VLPrefillRuntimeAdapter(
+        trt_prefill,
+        num_deepstack=num_deepstack,
+    ).eval()
+
     model._trt_vlm_backbone = trt_backbone
+    model._trt_vlm_prefill_backbone = trt_prefill
+    model._trt_vlm_prefill_runtime = prefill_runtime_adapter
     logger.info("✓ VLM LM compiled with KV cache I/O (stored as model._trt_vlm_backbone)")
 
     _install_hf_generate_wrapper_adapter(
         model=model,
         wrapper=trt_backbone,
+        prefill_wrapper=prefill_runtime_adapter,
         device=device,
         dtype=dtype,
     )
-    logger.info("Installed trt_backbone adapter on language_model.forward")
+    logger.info("Installed TRT decode+prefill adapter on language_model.forward")
+    language_model.get_input_embeddings = lambda: embedding_fn.cuda()
     return trt_backbone

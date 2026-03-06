@@ -168,7 +168,7 @@ def _build_diffusion_module(
 
 def _make_sample_inputs(
     cfg: dict, min_prefix_len: int, max_prefix_len: int,
-    dtype: torch.dtype, device: str,
+    dtype: torch.dtype, device: str, batch_size: int,
 ) -> tuple[tuple, dict, callable]:
     """
     Build opt-profile sample inputs, dynamic shapes spec, and a helper that
@@ -181,7 +181,9 @@ def _make_sample_inputs(
     num_layers         = cfg["num_layers"]
     num_kv_heads       = cfg["num_kv_heads"]
     head_dim           = cfg["head_dim"]
-    B = 1
+    B = int(batch_size)
+    if B <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
     opt_prefix_len = (min_prefix_len + max_prefix_len) // 2
 
     def make_inputs(prefix_len: int) -> list[torch.Tensor]:
@@ -262,6 +264,7 @@ def compile_diffusion_step_no_cache(
     model: nn.Module,
     max_prefix_len: int,
     min_prefix_len: int = 1,
+    batch_size: int = 1,
     device: str = "cuda",
     offload_module_to_cpu: bool = False,
     debug: bool = False,
@@ -289,19 +292,20 @@ def compile_diffusion_step_no_cache(
     """
     import torch_tensorrt
 
-    dtype = torch.bfloat16
+    dtype = torch.float16
     module, cfg = _build_diffusion_module(model, dtype, device)
 
     logger.info("=" * 60)
     logger.info("Compiling Dynamic-KV Diffusion Step with TRT")
     logger.info(f"  prefix_len range:   [{min_prefix_len}, {max_prefix_len}]")
+    logger.info(f"  batch_size:         {batch_size}")
     logger.info(f"  n_diffusion_tokens: {cfg['n_diffusion_tokens']}")
     logger.info(f"  expert:             {cfg['num_layers']} layers, {cfg['num_kv_heads']} KV heads, {cfg['head_dim']} head_dim")
     logger.info(f"  action_space_dims:  {cfg['action_space_dims']}")
     logger.info(f"  offload_module_to_cpu: {offload_module_to_cpu}")
 
     sample_inputs, dynamic_shapes, make_inputs = _make_sample_inputs(
-        cfg, min_prefix_len, max_prefix_len, dtype, device
+        cfg, min_prefix_len, max_prefix_len, dtype, device, batch_size
     )
 
     ref_output = None
@@ -378,7 +382,7 @@ def save_diffusion_engine(
 
     from alpamayo_r1.trt.engine_io import save_trt_engine
 
-    dtype = torch.bfloat16
+    dtype = torch.float16
     module, cfg = _build_diffusion_module(model, dtype, device)
 
     logger.info("=" * 60)
@@ -421,7 +425,7 @@ def save_diffusion_engine(
     metadata = {
         "component": "diffusion",
         "save_format": "raw_trt_engine",
-        "precision": "BF16",
+        "precision": "FP16",
         "min_prefix_len": min_prefix_len,
         "max_prefix_len": max_prefix_len,
         "n_diffusion_tokens": cfg["n_diffusion_tokens"],

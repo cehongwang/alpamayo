@@ -324,7 +324,7 @@ def _prepare_vision_module(
     Patch attention, configure the model, and return
     (VisualFixedGrid, pixel_values, image_grid_thw).
     """
-    dtype = torch.bfloat16
+    dtype = torch.float16
 
     visual_model.config.attn_implementation = "sdpa"
     visual_model.config._attn_implementation = "sdpa"
@@ -427,7 +427,7 @@ def compile_vision_model(
     if offload_module_to_cpu:
         # TRT compile may offload underlying vision weights to CPU.
         # Move back before running the PyTorch reference check.
-        wrapped = wrapped.to(device=device, dtype=torch.bfloat16).eval()
+        wrapped = wrapped.to(device=device, dtype=torch.float16).eval()
     wrapped_trt_model = _RepeatCollapseVisionWrapper(
         trt_model=trt_model,
         base_pixel_rows=int(pixel_values.shape[0]),
@@ -551,7 +551,7 @@ def save_vision_engine(
 
     metadata = {
         "component": "vision",
-        "precision": "BF16",
+        "precision": "FP16",
         "pixel_values_shape": list(pixel_values.shape),
         "pixel_values_dtype": str(pixel_values.dtype),
         "image_grid_thw": image_grid_thw.tolist(),

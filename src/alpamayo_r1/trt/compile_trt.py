@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from typing import Any
@@ -75,7 +76,8 @@ def compile_vision_trt(
 
 def compile_diffusion_no_cache_trt(
     model: nn.Module,
-    prefix_seq_len: int,
+    max_prefix_len: int,
+    batch_size: int = 1,
     offload_module_to_cpu: bool = False,
 ) -> nn.Module | None:
     logger.info("\n" + "=" * 60)
@@ -86,7 +88,8 @@ def compile_diffusion_no_cache_trt(
 
     compile_diffusion_step_no_cache(
         model,
-        max_prefix_len=prefix_seq_len,
+        max_prefix_len=max_prefix_len,
+        batch_size=int(batch_size),
         device="cuda",
         offload_module_to_cpu=offload_module_to_cpu,
         debug=False,
@@ -153,21 +156,32 @@ def measure_prefix_seq_len_for_trt(
     _eos_id = model.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
 
     configure_generation(model, num_return_sequences=1, max_new_tokens=max_generation_length)
+    output_embeddings = model.vlm.get_output_embeddings()
+    vlm_dtype = (
+        output_embeddings.weight.dtype
+        if output_embeddings is not None
+        else next(model.vlm.parameters()).dtype
+    )
+    use_autocast = torch.cuda.is_available() and vlm_dtype in (torch.float16, torch.bfloat16)
+    autocast_ctx = (
+        torch.autocast("cuda", dtype=vlm_dtype) if use_autocast else contextlib.nullcontext()
+    )
     with torch.no_grad():
-        _vlm_out = model.vlm.generate(
-            input_ids=_input_ids,
-            generation_config=model.vlm.generation_config,
-            stopping_criteria=StoppingCriteriaList([StopAfterEOS(eos_token_id=_eos_id)]),
-            logits_processor=LogitsProcessorList(
-                [
-                    ExpertLogitsProcessor(
-                        traj_token_offset=model.config.traj_token_start_idx,
-                        traj_vocab_size=model.config.traj_vocab_size,
-                    )
-                ]
-            ),
-            **_tokenized,
-        )
+        with autocast_ctx:
+            _vlm_out = model.vlm.generate(
+                input_ids=_input_ids,
+                generation_config=model.vlm.generation_config,
+                stopping_criteria=StoppingCriteriaList([StopAfterEOS(eos_token_id=_eos_id)]),
+                logits_processor=LogitsProcessorList(
+                    [
+                        ExpertLogitsProcessor(
+                            traj_token_offset=model.config.traj_token_start_idx,
+                            traj_vocab_size=model.config.traj_vocab_size,
+                        )
+                    ]
+                ),
+                **_tokenized,
+            )
     return int(_vlm_out.past_key_values.get_seq_length())
 
 
@@ -195,13 +209,13 @@ def compile_trt_modules(
 
     model_inputs = create_inputs_fn()
     trt_vision = None
-    # trt_vision = compile_vision_trt(
-    #     model,
-    #     model_inputs,
-    #     offload_module_to_cpu=offload_module_to_cpu,
-    # )
-    # if trt_vision is None:
-    #     logger.error("Failed to compile vision model")
+    trt_vision = compile_vision_trt(
+        model,
+        model_inputs,
+        offload_module_to_cpu=offload_module_to_cpu,
+    )
+    if trt_vision is None:
+        logger.error("Failed to compile vision model")
 
     lm_seq_len = (
         int(prefix_seq_len + max_generation_length)
@@ -227,13 +241,18 @@ def compile_trt_modules(
 
 
     trt_diffusion = None
-    # trt_diffusion = compile_diffusion_no_cache_trt(
-    #     model,
-    #     prefix_seq_len=prefix_seq_len,
-    #     offload_module_to_cpu=offload_module_to_cpu,
-    # )
-    # if trt_diffusion is None:
-    #     logger.error("Failed to compile no-cache diffusion step")
+    diffusion_max_prefix_len = max(int(prefix_seq_len), int(lm_seq_len))
+    logger.info(f"  diffusion max_prefix_len = {diffusion_max_prefix_len}")
+    trt_diffusion = compile_diffusion_no_cache_trt(
+        model,
+        max_prefix_len=diffusion_max_prefix_len,
+        batch_size=compile_batch,
+        offload_module_to_cpu=offload_module_to_cpu,
+    )
+    if trt_diffusion is None:
+        logger.error("Failed to compile no-cache diffusion step")
+    else:
+        model._trt_diffusion_batch_size = int(compile_batch)
 
 
     return trt_vision, trt_lm, trt_diffusion, prefix_seq_len
@@ -262,7 +281,7 @@ def run_inference_trt(
     torch.cuda.manual_seed_all(seed)
     model_inputs = create_inputs_fn()
 
-    dtype = torch.bfloat16
+    dtype = torch.float16
     device = "cuda"
 
     start_time = time.perf_counter()
@@ -351,27 +370,40 @@ def run_inference_trt(
         delta = vlm_outputs.rope_deltas + offset[:, None]
         position_ids = position_ids + delta.to(device)
 
-        neg_inf = torch.finfo(torch.float32).min
+        neg_inf = torch.finfo(dtype).min
         attention_mask = torch.zeros(
             b_star,
             1,
             n_diffusion_tokens,
             prefill_seq_len + n_diffusion_tokens,
-            dtype=torch.float32,
+            dtype=dtype,
             device=device,
         )
         for i in range(b_star):
             attention_mask[i, :, :, offset[i] : -n_diffusion_tokens] = neg_inf
-        attention_mask = attention_mask.to(dtype)
 
         prefix_k, prefix_v = stack_prefix_kv_from_cache(
             prompt_cache,
             device=torch.device(device),
             dtype=dtype,
         )
+        # Defensive cast to guarantee TRT KV input dtypes stay aligned.
+        prefix_k = prefix_k.to(device=device, dtype=dtype).contiguous()
+        prefix_v = prefix_v.to(device=device, dtype=dtype).contiguous()
         prompt_cache = PrefixKVCache(prefix_k, prefix_v)
         if trt_diffusion is not None:
             logger.info(f"  prefix_k shape: {prefix_k.shape}")
+            if prefix_k.dtype != dtype or prefix_v.dtype != dtype:
+                raise TypeError(
+                    f"TRT KV dtype mismatch: expected {dtype}, got "
+                    f"prefix_k={prefix_k.dtype}, prefix_v={prefix_v.dtype}"
+                )
+            compiled_diff_batch = getattr(model, "_trt_diffusion_batch_size", None)
+            if compiled_diff_batch is not None and int(b_star) != int(compiled_diff_batch):
+                raise ValueError(
+                    f"TRT diffusion batch mismatch: compiled batch={compiled_diff_batch}, runtime batch={b_star}. "
+                    "Recompile TRT diffusion with matching batch (input_batch * num_traj_samples)."
+                )
 
         forward_kwargs = {}
         if model.config.expert_non_causal_attention:

@@ -79,7 +79,7 @@ def compute_minade_for_clip_pytorch(
         torch.cuda.manual_seed_all(seed)
 
     start = time.perf_counter()
-    with torch.autocast("cuda", dtype=torch.bfloat16):
+    with torch.autocast("cuda", dtype=torch.float16):
         pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
             data=model_inputs,
             top_p=top_p,
@@ -196,7 +196,9 @@ def main():
     print(f"Loaded {len(clip_ids)} clip_ids from: {parquet_path}")
 
     device = "cuda"
-    model = AlpamayoR1.from_pretrained(args.ckpt, dtype=torch.bfloat16).to(device)
+    model = AlpamayoR1.from_pretrained(args.ckpt, dtype=torch.float16).to(
+        device=device, dtype=torch.float16
+    )
     model.eval()
     seed = None if args.seed < 0 else args.seed
 
@@ -251,7 +253,7 @@ def main():
 
     for i, clip_id in enumerate(it, start=1):
 
-        if i > 20: break
+        # if i > 20: break
         try:
             if args.compile_trt:
                 minade, elapsed_ms = compute_minade_for_clip_trt(
