@@ -24,6 +24,33 @@ import torch
 from einops import rearrange
 
 
+def _patch_physical_aiav_metadata_filename() -> None:
+    """Patch physical_ai_av at runtime for metadata filename compatibility.
+
+    Some dataset revisions use `metadata/feature_presence.parquet` instead of
+    `metadata/sensor_presence.parquet`. This keeps project code working without
+    editing the installed third-party package.
+    """
+    cls = physical_ai_av.utils.hf_interface.HfRepoInterface
+    if getattr(cls, "_alpamayo_metadata_filename_patch_applied", False):
+        return
+
+    original_download_file = cls.download_file
+
+    def _download_file_compat(self, filename: str, **kwargs):
+        if filename == "metadata/sensor_presence.parquet":
+            try:
+                return original_download_file(self, filename, **kwargs)
+            except IndexError:
+                return original_download_file(
+                    self, "metadata/feature_presence.parquet", **kwargs
+                )
+        return original_download_file(self, filename, **kwargs)
+
+    cls.download_file = _download_file_compat
+    cls._alpamayo_metadata_filename_patch_applied = True
+
+
 def load_physical_aiavdataset(
     clip_id: str,
     t0_us: int = 5_100_000,
@@ -68,6 +95,7 @@ def load_physical_aiavdataset(
             - clip_id: The clip ID
     """
     if avdi is None:
+        _patch_physical_aiav_metadata_filename()
         avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
 
     if camera_features is None:
