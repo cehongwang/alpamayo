@@ -559,3 +559,80 @@ def save_vision_engine(
     save_trt_engine(engine_bytes, path, metadata)
     logger.info(f"✓ Vision engine saved to {path}")
     return True
+
+
+class _FP16CastWrapper(nn.Module):
+    """Casts inputs to FP16 before calling the TRT vision model.
+
+    Used by the plugin-LM pipeline so a single ``trt_vision(pv, grid_thw)`` call
+    works regardless of the caller's ambient dtype.
+    """
+
+    def __init__(self, trt_model):
+        super().__init__()
+        self.trt_model = trt_model
+
+    def forward(self, hidden_states, grid_thw=None):
+        return self.trt_model(hidden_states.to(torch.float16), grid_thw)
+
+
+def compile_vision_fp16(model: nn.Module, model_inputs: dict) -> nn.Module:
+    """Compile the vision encoder as an FP16 TRT engine for the plugin pipeline.
+
+    Bakes ``image_grid_thw`` into ``VisualFixedGrid``, then wraps the raw TRT
+    engine with ``_RepeatCollapseVisionWrapper`` (to expose the
+    ``(image_embeds, deepstack_embeds)`` output contract the VLM expects) and
+    ``_FP16CastWrapper`` (for dtype-safe calls from BF16/FP32 contexts).
+    """
+    import copy
+
+    import torch_tensorrt
+
+    fp16 = torch.float16
+    device = torch.device("cuda:0")
+
+    logger.info("Compiling Vision TRT (FP16 plugin pipeline)...")
+    _patch_qwen3vl_vision_attention()
+
+    vis = copy.deepcopy(model.vlm.model.visual).to(dtype=fp16, device=device).eval()
+    vis.config.attn_implementation = "sdpa"
+    vis.config._attn_implementation = "sdpa"
+    vis.config.use_cache = False
+
+    pv = model_inputs["tokenized_data"]["pixel_values"].to(dtype=fp16, device=device)
+    igt = model_inputs["tokenized_data"]["image_grid_thw"].to(device=device)
+
+    wrapped = VisualFixedGrid(vis, igt).to(device).eval()
+    ep = _export_vision_module(wrapped, (pv, None))
+    trt_raw = torch_tensorrt.dynamo.compile(
+        ep,
+        (pv, None),
+        truncate_double=True,
+        min_block_size=1,
+        use_python_runtime=True,
+        immutable_weights=True,
+        use_explicit_typing=True,
+        use_fp32_acc=True,
+    )
+    trt_repeat = _RepeatCollapseVisionWrapper(
+        trt_model=trt_raw,
+        base_pixel_rows=int(pv.shape[0]),
+        base_grid_rows=int(igt.shape[0]),
+    ).eval()
+    trt_vision = _FP16CastWrapper(trt_repeat).eval()
+
+    with torch.no_grad():
+        ref = wrapped(pv, None)
+        trt = trt_vision(pv, None)
+    ref_f = ref[0].float().flatten()
+    trt_f = trt[0].float().flatten()
+    cos_sim = F.cosine_similarity(ref_f.unsqueeze(0), trt_f.unsqueeze(0)).item()
+    max_diff = (ref_f - trt_f).abs().max().item()
+    logger.info(f"  Vision: cos_sim={cos_sim:.6f}, max|Δ|={max_diff:.6f}")
+    logger.info("  ✅ Vision TRT (FP16 plugin) compiled")
+
+    del vis, wrapped
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+    return trt_vision

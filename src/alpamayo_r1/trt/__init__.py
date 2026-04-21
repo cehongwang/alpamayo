@@ -42,6 +42,7 @@ alpamayo_r1.trt.engine_io
 """
 
 from alpamayo_r1.trt.diffusion import (
+    compile_diffusion_fp16,
     compile_diffusion_step_no_cache,
     save_diffusion_engine,
 )
@@ -49,12 +50,11 @@ from alpamayo_r1.trt.engine_io import (
     TRTEngineRunner,
     save_trt_engine,
 )
-from alpamayo_r1.trt.lm import (
-    compile_vlm_lm_trt,
-    generate_alpamayo_with_static_cache,
-)
+
+from alpamayo_r1.trt.lm_plugin import compile_vlm_lm_trt_with_plugin
 from alpamayo_r1.trt.vision import (
     compile_and_replace_vision_model,
+    compile_vision_fp16,
     compile_vision_model,
     save_vision_engine,
 )
@@ -63,12 +63,15 @@ __all__ = [
     # Vision
     "compile_vision_model",
     "compile_and_replace_vision_model",
+    "compile_vision_fp16",
     "save_vision_engine",
     # LM
     "compile_vlm_lm_trt",
+    "compile_vlm_lm_trt_with_plugin",
     "generate_alpamayo_with_static_cache",
     # Diffusion
     "compile_diffusion_step_no_cache",
+    "compile_diffusion_fp16",
     "save_diffusion_engine",
     # Engine I/O
     "save_trt_engine",

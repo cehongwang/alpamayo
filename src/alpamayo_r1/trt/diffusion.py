@@ -437,3 +437,59 @@ def save_diffusion_engine(
     save_trt_engine(engine_bytes, path, metadata)
     logger.info(f"✓ Diffusion engine saved to {path}")
     return True
+
+
+def compile_diffusion_fp16(
+    model: nn.Module,
+    min_prefix_len: int,
+    max_prefix_len: int,
+    batch_size: int = 1,
+) -> nn.Module:
+    """Compile the diffusion denoiser as an FP16 TRT engine for the plugin pipeline.
+
+    Thin wrapper over ``_build_diffusion_module`` + ``_make_sample_inputs`` +
+    ``torch_tensorrt.dynamo.compile`` with a dynamic ``prefix_len`` dimension.
+    """
+    import gc
+
+    import torch.nn.functional as F
+    import torch_tensorrt
+
+    fp16 = torch.float16
+    logger.info(f"Compiling Diffusion TRT (FP16, batch={batch_size})...")
+
+    module, cfg = _build_diffusion_module(model, dtype=fp16, device="cuda")
+    sample_inputs, dyn_shapes, make_fn = _make_sample_inputs(
+        cfg, min_prefix_len, max_prefix_len, fp16, "cuda", batch_size=batch_size,
+    )
+
+    with torch.no_grad():
+        ref = module(*sample_inputs)
+    exported = _export_diffusion_module(module, sample_inputs, dyn_shapes)
+    opt = (min_prefix_len + max_prefix_len) // 2
+    specs = _build_trt_input_specs(make_fn, min_prefix_len, opt, max_prefix_len)
+
+    trt_diff = torch_tensorrt.dynamo.compile(
+        exported,
+        inputs=specs,
+        use_explicit_typing=True,
+        use_fp32_acc=True,
+        truncate_double=True,
+        min_block_size=1,
+        use_python_runtime=True,
+        decompose_attention=True,
+    )
+
+    with torch.no_grad():
+        trt_out = trt_diff(*sample_inputs)
+    ref_f = ref.float().flatten()
+    trt_f = trt_out.float().flatten()
+    cos_sim = F.cosine_similarity(ref_f.unsqueeze(0), trt_f.unsqueeze(0)).item()
+    max_diff = (ref_f - trt_f).abs().max().item()
+    logger.info(f"  Diffusion: cos_sim={cos_sim:.6f}, max|Δ|={max_diff:.6f}")
+    logger.info(f"  ✅ Diffusion TRT (FP16) compiled (batch={batch_size})")
+
+    del module, exported, sample_inputs
+    torch.cuda.empty_cache()
+    gc.collect()
+    return trt_diff
