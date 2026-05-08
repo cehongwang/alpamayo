@@ -566,14 +566,35 @@ class _FP16CastWrapper(nn.Module):
 
     Used by the plugin-LM pipeline so a single ``trt_vision(pv, grid_thw)`` call
     works regardless of the caller's ambient dtype.
+
+    Accepts ``return_dict`` and any extra ``**kwargs`` because
+    ``transformers>=5.3`` passes them through ``get_image_features``.
     """
 
     def __init__(self, trt_model):
         super().__init__()
         self.trt_model = trt_model
 
-    def forward(self, hidden_states, grid_thw=None):
-        return self.trt_model(hidden_states.to(torch.float16), grid_thw)
+    def forward(self, hidden_states, grid_thw=None, return_dict: bool = False, **kwargs):
+        out = self.trt_model(hidden_states.to(torch.float16), grid_thw)
+        # Legacy code expects a (image_embeds, deepstack_feature_lists) tuple.
+        # transformers>=5.3 wraps the visual output in
+        # BaseModelOutputWithDeepstackFeatures and accesses .pooler_output /
+        # .deepstack_features; return that shape when return_dict=True.
+        if return_dict:
+            try:
+                from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+                    BaseModelOutputWithDeepstackFeatures,
+                )
+                image_embeds, deepstack_feature_lists = out
+                return BaseModelOutputWithDeepstackFeatures(
+                    last_hidden_state=image_embeds,
+                    pooler_output=image_embeds,
+                    deepstack_features=deepstack_feature_lists,
+                )
+            except Exception:
+                pass
+        return out
 
 
 def compile_vision_fp16(model: nn.Module, model_inputs: dict) -> nn.Module:

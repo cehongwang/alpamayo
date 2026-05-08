@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import gc
-import math
 import argparse
+import gc
+import json
+import math
 import time
-import pandas as pd
 from pathlib import Path
+
+import pandas as pd
 
 import torch
 import numpy as np
@@ -17,6 +19,52 @@ from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 from alpamayo_r1.test_trt_torch import prepare_model_inputs
 from alpamayo_r1.trt.compile_trt import compile_trt_modules, run_inference_trt
+
+
+def resolve_ckpt_path(ckpt_arg: str) -> Path:
+    """Resolve a checkpoint path or pick the latest checkpoint-* child."""
+    ckpt_path = Path(ckpt_arg).expanduser().resolve()
+    if not ckpt_path.is_dir():
+        return ckpt_path
+
+    if (ckpt_path / "config.json").is_file():
+        return ckpt_path
+
+    checkpoint_dirs = [
+        path
+        for path in ckpt_path.iterdir()
+        if path.is_dir() and path.name.startswith("checkpoint-")
+    ]
+    if not checkpoint_dirs:
+        return ckpt_path
+
+    return max(checkpoint_dirs, key=lambda path: int(path.name.split("-", 1)[1]))
+
+
+def resolve_vlm_name_or_path(ckpt_path: Path, override: str | None) -> str:
+    """Prefer an explicit override, otherwise repair stale local checkpoint configs."""
+    if override:
+        return override
+
+    config_path = ckpt_path / "config.json"
+    if not config_path.is_file():
+        return helper.BASE_PROCESSOR_NAME
+
+    with config_path.open() as f:
+        config = json.load(f)
+
+    vlm_name_or_path = config.get("vlm_name_or_path")
+    if not isinstance(vlm_name_or_path, str) or not vlm_name_or_path:
+        return helper.BASE_PROCESSOR_NAME
+
+    if Path(vlm_name_or_path).is_absolute() and not Path(vlm_name_or_path).exists():
+        print(
+            "Embedded vlm_name_or_path is missing; "
+            f"falling back to {helper.BASE_PROCESSOR_NAME}: {vlm_name_or_path}"
+        )
+        return helper.BASE_PROCESSOR_NAME
+
+    return vlm_name_or_path
 
 def read_clip_ids_from_parquet(parquet_path: str) -> list[str]:
     """
@@ -143,6 +191,12 @@ def main():
     ap.add_argument("--parquet", type=str, default="1005_7cam_gold_eval_metadb_public.parquet")
     ap.add_argument("--t0_us", type=int, default=5_100_000)
     ap.add_argument("--ckpt", type=str, default="nvidia/Alpamayo-R1-10B")
+    ap.add_argument(
+        "--vlm_name_or_path",
+        type=str,
+        default=None,
+        help="Optional override for the VLM processor/config path or Hub id.",
+    )
     ap.add_argument("--num_traj_samples", type=int, default=6)
     ap.add_argument("--max_generation_length", type=int, default=256)
     ap.add_argument("--top_p", type=float, default=0.98)
@@ -196,7 +250,15 @@ def main():
     print(f"Loaded {len(clip_ids)} clip_ids from: {parquet_path}")
 
     device = "cuda"
-    model = AlpamayoR1.from_pretrained(args.ckpt, dtype=torch.float16).to(
+    ckpt_path = resolve_ckpt_path(args.ckpt)
+    vlm_name_or_path = resolve_vlm_name_or_path(ckpt_path, args.vlm_name_or_path)
+    print(f"Loading checkpoint from: {ckpt_path}")
+    print(f"Using vlm_name_or_path: {vlm_name_or_path}")
+    model = AlpamayoR1.from_pretrained(
+        str(ckpt_path),
+        dtype=torch.float16,
+        vlm_name_or_path=vlm_name_or_path,
+    ).to(
         device=device, dtype=torch.float16
     )
     model.eval()

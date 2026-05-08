@@ -908,6 +908,7 @@ def compile_vlm_lm_trt_with_cache(
         "debug": debug,
         "allow_complex_guards_as_runtime_asserts": True,
         "offload_module_to_cpu": False,
+        "decompose_attention": True,
     }
 
     trt_inputs = [

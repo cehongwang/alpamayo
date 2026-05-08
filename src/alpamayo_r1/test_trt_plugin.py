@@ -145,9 +145,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_generation_length", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-trt", action="store_true", help="Skip TRT compilation")
-    parser.add_argument("--benchmark", action="store_true")
-    parser.add_argument("--benchmark-runs", type=int, default=5)
+    parser.add_argument("--skip-pytorch", action="store_true", help="Skip PyTorch baseline")
+    parser.add_argument("--num-iterations", type=int, default=12, help="Total iterations (incl. warmup)")
+    parser.add_argument("--warmup", type=int, default=3, help="Warmup iterations to exclude from stats")
     return parser.parse_args()
+
+
+def _print_timing(name: str, times_ms: list[float]) -> None:
+    arr = np.array(times_ms)
+    if len(arr) == 0:
+        return
+    print(
+        f"  {name:<22} min={arr.min():7.1f}  avg={arr.mean():7.1f}  "
+        f"max={arr.max():7.1f}  std={arr.std():6.1f}  (ms)"
+    )
+
+
+def _print_minade(name: str, ades: list[float]) -> None:
+    arr = np.array(ades)
+    if len(arr) == 0:
+        return
+    print(
+        f"  {name:<22} min={arr.min():7.4f}  avg={arr.mean():7.4f}  "
+        f"max={arr.max():7.4f}  std={arr.std():6.4f}  (m)"
+    )
 
 
 def main() -> int:
@@ -157,68 +178,59 @@ def main() -> int:
 
     from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
 
+    print(
+        f"clip_id={args.clip_id}  num_traj_samples={args.num_traj_samples}  "
+        f"iters={args.num_iterations}  warmup={args.warmup}  "
+        f"skip_pytorch={args.skip_pytorch}  skip_trt={args.skip_trt}"
+    )
+
     model = AlpamayoR1.from_pretrained(args.model_path, dtype=torch.float16).to("cuda")
     model.eval()
     model.config.attn_implementation = "sdpa"
 
     create_inputs_fn = prepare_model_inputs(model, data, messages, device="cuda")
 
-    pred_xyz_pt, _, extra_pt, pt_time = run_inference_pytorch(
-        model,
-        create_inputs_fn,
-        seed=args.seed,
-        num_traj_samples=args.num_traj_samples,
-        max_generation_length=args.max_generation_length,
-    )
-    pt_metrics = compute_trajectory_metrics(pred_xyz_pt, gt_xyz)
-    logger.info("PyTorch minADE: %.4f m", pt_metrics["min_ade"])
-    logger.info("PyTorch CoC: %s...", extra_pt["cot"][0][0, 0][:120])
+    # ── Compile TRT engines once (iter -1) ────────────────────────────
+    trt_vision = trt_lm = trt_diffusion = plugin_info = None
+    if not args.skip_trt:
+        trt_vision, trt_lm, trt_diffusion, plugin_info = compile_trt_with_plugin(
+            model,
+            create_inputs_fn,
+            seed=args.seed,
+            max_generation_length=args.max_generation_length,
+            num_traj_samples=args.num_traj_samples,
+        )
 
-    if args.skip_trt:
-        return 0
+    pt_times: list[float] = []
+    pt_ades: list[float] = []
+    trt_times: list[float] = []
+    trt_ades: list[float] = []
+    pt_coc = trt_coc = "(skipped)"
 
-    trt_vision, trt_lm, trt_diffusion, plugin_info = compile_trt_with_plugin(
-        model,
-        create_inputs_fn,
-        seed=args.seed,
-        max_generation_length=args.max_generation_length,
-        num_traj_samples=args.num_traj_samples,
-    )
+    for i in range(args.num_iterations):
+        print(f"\n=== iter {i} (clip={args.clip_id}) ===", flush=True)
 
-    pred_xyz_trt, _, extra_trt, trt_time = run_inference_trt_plugin(
-        model,
-        create_inputs_fn,
-        trt_vision=trt_vision,
-        trt_lm=trt_lm,
-        trt_diffusion=trt_diffusion,
-        plugin_info=plugin_info,
-        seed=args.seed,
-        num_traj_samples=args.num_traj_samples,
-        max_generation_length=args.max_generation_length,
-    )
-    trt_metrics = compute_trajectory_metrics(pred_xyz_trt, gt_xyz)
-    logger.info("TRT-Plugin minADE: %.4f m", trt_metrics["min_ade"])
-    logger.info("TRT-Plugin CoC: %s...", extra_trt["cot"][0][0, 0][:120])
-    logger.info(
-        "timing (single run) pytorch=%.2fms trt_plugin=%.2fms",
-        pt_time * 1000,
-        trt_time * 1000,
-    )
-
-    if args.benchmark:
-        pytorch_avg = benchmark_inference(
-            run_fn=lambda: run_inference_pytorch(
+        # ── PyTorch FP16 baseline ────────────────────────────────────
+        if not args.skip_pytorch:
+            torch.cuda.synchronize(); t = time.perf_counter()
+            pred_xyz_pt, _, extra_pt, _ = run_inference_pytorch(
                 model,
                 create_inputs_fn,
                 seed=args.seed,
                 num_traj_samples=args.num_traj_samples,
                 max_generation_length=args.max_generation_length,
-            ),
-            num_runs=args.benchmark_runs,
-            label="PyTorch FP16",
-        )
-        trt_avg = benchmark_inference(
-            run_fn=lambda: run_inference_trt_plugin(
+            )
+            torch.cuda.synchronize(); pt_elapsed = 1000 * (time.perf_counter() - t)
+            pt_metrics = compute_trajectory_metrics(pred_xyz_pt, gt_xyz)
+            pt_coc = str(extra_pt["cot"][0][0, 0])
+            pt_times.append(pt_elapsed)
+            pt_ades.append(pt_metrics["min_ade"])
+            print(f"  PyTorch    : {pt_elapsed:7.1f} ms   minADE={pt_metrics['min_ade']:.4f} m")
+
+        # ── TRT Plugin FP16 ──────────────────────────────────────────
+        if not args.skip_trt:
+            torch.cuda.synchronize(); t = time.perf_counter()
+            pred_xyz_trt, _, extra_trt, _ = run_inference_trt_plugin(
                 model,
                 create_inputs_fn,
                 trt_vision=trt_vision,
@@ -228,15 +240,34 @@ def main() -> int:
                 seed=args.seed,
                 num_traj_samples=args.num_traj_samples,
                 max_generation_length=args.max_generation_length,
-            ),
-            num_runs=args.benchmark_runs,
-            label="TRT Plugin FP16",
-        )
-        logger.info(
-            "benchmark avg (ms): pytorch=%.2f trt_plugin=%.2f",
-            pytorch_avg * 1000,
-            trt_avg * 1000,
-        )
+            )
+            torch.cuda.synchronize(); trt_elapsed = 1000 * (time.perf_counter() - t)
+            trt_metrics = compute_trajectory_metrics(pred_xyz_trt, gt_xyz)
+            trt_coc = str(extra_trt["cot"][0][0, 0])
+            trt_times.append(trt_elapsed)
+            trt_ades.append(trt_metrics["min_ade"])
+            print(f"  TRT Plugin : {trt_elapsed:7.1f} ms   minADE={trt_metrics['min_ade']:.4f} m")
+
+    print("\n" + "=" * 78)
+    print(f"Summary  (warmup={args.warmup} / {args.num_iterations}, hot iters {args.warmup}–{args.num_iterations - 1})")
+    print("=" * 78)
+    if pt_times:
+        _print_timing("PyTorch FP16",   pt_times[args.warmup :])
+        _print_minade("PyTorch FP16",   pt_ades[args.warmup :])
+    if trt_times:
+        _print_timing("TRT Plugin FP16", trt_times[args.warmup :])
+        _print_minade("TRT Plugin FP16", trt_ades[args.warmup :])
+
+    if pt_times and trt_times:
+        pt_avg = float(np.mean(pt_times[args.warmup :]))
+        trt_avg = float(np.mean(trt_times[args.warmup :]))
+        speedup = pt_avg / trt_avg if trt_avg > 0 else float("nan")
+        print(f"\n  Speedup (TRT vs PyTorch): {speedup:5.2f}x   ({pt_avg:.1f} → {trt_avg:.1f} ms)")
+
+    print("\nCoC outputs (last iter):")
+    print(f"  PyTorch    : {pt_coc[:100]}...")
+    print(f"  TRT Plugin : {trt_coc[:100]}...")
+
     return 0
 
 

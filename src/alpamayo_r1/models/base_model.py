@@ -439,7 +439,12 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
         """Get the input embeddings of the model."""
         return self.vlm.language_model.embed_tokens
 
-    def tie_weights(self) -> None:
-        """Delegate weight tying to the nested VLM model."""
+    def tie_weights(self, *args, **kwargs) -> None:
+        """Delegate weight tying to the nested VLM model.
+
+        Accepts ``*args, **kwargs`` because transformers>=5.3 passes new
+        kwargs like ``recompute_mapping`` from ``init_weights``; those are
+        only meaningful to the base HF model, so we forward them through.
+        """
         if hasattr(self.vlm, "tie_weights"):
-            self.vlm.tie_weights()
+            self.vlm.tie_weights(*args, **kwargs)

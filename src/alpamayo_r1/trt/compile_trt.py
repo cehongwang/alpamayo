@@ -75,7 +75,13 @@ def run_vlm_preprocessing(
         inputs_embeds = lm_ref.embed_tokens(input_ids)
         pv = tokenized_data["pixel_values"].to(device)
         igt = tokenized_data["image_grid_thw"].to(device)
-        image_embeds, ds_embeds = vlm_model.get_image_features(pv, igt)
+        _vision_out = vlm_model.get_image_features(pv, igt)
+        if isinstance(_vision_out, tuple):
+            image_embeds, ds_embeds = _vision_out
+        else:
+            # transformers>=5.3 returns BaseModelOutputWithDeepstackFeatures
+            image_embeds = _vision_out.pooler_output
+            ds_embeds = _vision_out.deepstack_features
         image_cat = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
         image_mask, _ = vlm_model.get_placeholder_mask(
             input_ids, inputs_embeds=inputs_embeds, image_features=image_cat
@@ -85,9 +91,22 @@ def run_vlm_preprocessing(
         attn = tokenized_data.get("attention_mask")
         if attn is not None:
             attn = attn.to(device)
-        position_ids, rope_deltas = vlm_model.get_rope_index(
-            input_ids, igt, video_grid_thw=None, attention_mask=attn
-        )
+        try:
+            position_ids, rope_deltas = vlm_model.get_rope_index(
+                input_ids, igt, video_grid_thw=None, attention_mask=attn
+            )
+        except (TypeError, IndexError):
+            # transformers>=5.3 renamed 2nd positional to mm_token_type_ids and
+            # requires it to mark which tokens are image (1) / video (2) / text (0).
+            image_token_id = vlm_model.config.image_token_id
+            mm_token_type_ids = (input_ids == image_token_id).int()
+            position_ids, rope_deltas = vlm_model.get_rope_index(
+                input_ids,
+                mm_token_type_ids=mm_token_type_ids,
+                image_grid_thw=igt,
+                video_grid_thw=None,
+                attention_mask=attn,
+            )
 
     if original_fwd is not None:
         vlm_model.visual.forward = original_fwd
@@ -733,6 +752,7 @@ def run_inference_trt_plugin(
     e_batch = embeds.to(dtype).repeat_interleave(num_traj_samples, dim=0)
     kvs = create_kv_caches(lm_cfg, max_seq_len, total_bsz, device, dtype)
     ctx = torch.full((total_bsz,), S_input, dtype=torch.int32, device=device)
+    # Prefill runs once per inference (seq_len = S_input ≠ 1), so never CUDA-graphed.
     logits, _ = trt_lm(e_batch, kvs, ctx, ds_stack)
 
     next_token = sample_token(
@@ -744,6 +764,7 @@ def run_inference_trt_plugin(
     pos = int(S_input)
 
     embed_tokens = embed_tokens.to(device)
+
     for _ in range(max_generation_length - 1):
         if bool(done.all()):
             break
