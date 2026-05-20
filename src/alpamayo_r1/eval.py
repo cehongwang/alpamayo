@@ -21,24 +21,7 @@ from alpamayo_r1.test_trt_torch import prepare_model_inputs
 from alpamayo_r1.trt.compile_trt import compile_trt_modules, run_inference_trt
 
 
-def resolve_ckpt_path(ckpt_arg: str) -> Path:
-    """Resolve a checkpoint path or pick the latest checkpoint-* child."""
-    ckpt_path = Path(ckpt_arg).expanduser().resolve()
-    if not ckpt_path.is_dir():
-        return ckpt_path
 
-    if (ckpt_path / "config.json").is_file():
-        return ckpt_path
-
-    checkpoint_dirs = [
-        path
-        for path in ckpt_path.iterdir()
-        if path.is_dir() and path.name.startswith("checkpoint-")
-    ]
-    if not checkpoint_dirs:
-        return ckpt_path
-
-    return max(checkpoint_dirs, key=lambda path: int(path.name.split("-", 1)[1]))
 
 
 def resolve_vlm_name_or_path(ckpt_path: Path, override: str | None) -> str:
@@ -250,14 +233,11 @@ def main():
     print(f"Loaded {len(clip_ids)} clip_ids from: {parquet_path}")
 
     device = "cuda"
-    ckpt_path = resolve_ckpt_path(args.ckpt)
-    vlm_name_or_path = resolve_vlm_name_or_path(ckpt_path, args.vlm_name_or_path)
+    ckpt_path = args.ckpt
     print(f"Loading checkpoint from: {ckpt_path}")
-    print(f"Using vlm_name_or_path: {vlm_name_or_path}")
     model = AlpamayoR1.from_pretrained(
         str(ckpt_path),
         dtype=torch.float16,
-        vlm_name_or_path=vlm_name_or_path,
     ).to(
         device=device, dtype=torch.float16
     )
