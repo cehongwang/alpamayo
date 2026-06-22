@@ -217,26 +217,23 @@ def compile_language_trt(
     offload_module_to_cpu: bool = False,
 ) -> nn.Module | None:
     logger.info("\n" + "=" * 60)
-    logger.info("Compiling Language Model with TensorRT")
+    logger.info("Compiling Language Model with TensorRT (HF StaticCache + aliased KV)")
     logger.info("=" * 60)
 
-    from alpamayo_r1.trt.lm_with_cache import compile_vlm_lm_trt_with_cache
+    from alpamayo_r1.trt.static_cache_lm import compile_vlm_lm_trt_static_cache
 
-    compiled_model = compile_vlm_lm_trt_with_cache(
+    del max_prefix_len, offload_module_to_cpu  # static cache is fixed-size, no offload
+    runner = compile_vlm_lm_trt_static_cache(
         model,
         max_seq_len=max_seq_len,
-        max_prefix_len=max_seq_len if max_prefix_len is None else max_prefix_len,
         batch_size=batch_size,
         device="cuda",
-        offload_module_to_cpu=offload_module_to_cpu,
+        dtype=torch.float16,
         debug=False,
-        accuracy_check=True,
     )
-    model._trt_vlm_backbone = compiled_model
-    model._trt_lm_max_batch_size = int(batch_size)
-    model._trt_lm_batch_size = int(batch_size)
-    logger.info("✓ Language model compiled with TRT")
-    return model._trt_vlm_backbone
+    model._trt_vlm_backbone = runner
+    logger.info("✓ Language model compiled with TRT (static cache runner)")
+    return runner
 
 
 def measure_prefix_seq_len_for_trt(
@@ -374,15 +371,19 @@ def run_inference_trt(
     num_traj_samples: int = 1,
     max_generation_length: int = 256,
 ) -> tuple[torch.Tensor, torch.Tensor, dict, float]:
-    """Run inference with TRT vision/language/diffusion modules."""
-    from alpamayo_r1.models.alpamayo_r1 import ExpertLogitsProcessor
+    """Run inference with TRT vision/language/diffusion modules.
+
+    The language model runs through the HF static-cache TRT engine: prefill is
+    eager (native multimodal forward, fills the cache), decode is the aliased
+    single-token engine. ``trt_lm`` is a ``StaticCacheLMRunner``.
+    """
     from alpamayo_r1.models.token_utils import (
-        StopAfterEOS,
         extract_text_tokens,
         replace_padding_after_eos,
         to_special_token,
     )
-    from alpamayo_r1.trt.prefix_cache import PrefixKVCache, stack_prefix_kv_from_cache
+    from alpamayo_r1.trt.prefix_cache import PrefixKVCache
+    from alpamayo_r1.trt.static_cache_lm import stack_static_kv
 
     torch.cuda.manual_seed_all(seed)
     model_inputs = create_inputs_fn()
@@ -390,90 +391,121 @@ def run_inference_trt(
     dtype = torch.float16
     device = "cuda"
 
+    runner = trt_lm  # StaticCacheLMRunner (or None for the eager fallback path)
+    eos_token_id = model.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
+    traj_off = model.config.traj_token_start_idx
+    traj_vocab = model.config.traj_vocab_size
+
     start_time = time.perf_counter()
 
     with torch.autocast("cuda", dtype=dtype):
         ego_history_xyz = model_inputs["ego_history_xyz"]
         ego_history_rot = model_inputs["ego_history_rot"]
-        B, _, _, _ = ego_history_xyz.shape
-        tokenized_data = model_inputs["tokenized_data"]
-        input_ids = tokenized_data.pop("input_ids")
+        B = int(ego_history_xyz.shape[0])
+        total_bsz = B * num_traj_samples
 
-        traj_data_vlm = {
-            "ego_history_xyz": ego_history_xyz,
-            "ego_history_rot": ego_history_rot,
-        }
-        input_ids = model.fuse_traj_tokens(input_ids, traj_data_vlm)
-
-        original_vision_forward = None
-        if trt_vision is not None:
-            original_vision_forward = model.vlm.model.visual.forward
-            model.vlm.model.visual.forward = trt_vision.forward
-
-        eos_token_id = model.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
-        configure_generation(
-            model,
-            num_return_sequences=num_traj_samples,
-            max_new_tokens=max_generation_length,
+        # --- VLM preprocessing: embeds + DeepStack + M-RoPE positions ---------
+        (
+            input_ids,
+            inputs_embeds,
+            ds_embeds,
+            vis_masks,
+            position_ids_prefill,
+            rope_deltas,
+        ) = run_vlm_preprocessing(
+            model, model_inputs, trt_vision=trt_vision, device=device, dtype=dtype
         )
 
-        stopping_criteria = StoppingCriteriaList([StopAfterEOS(eos_token_id=eos_token_id)])
-        logits_processor = LogitsProcessorList(
-            [
-                ExpertLogitsProcessor(
-                    traj_token_offset=model.config.traj_token_start_idx,
-                    traj_vocab_size=model.config.traj_vocab_size,
-                )
-            ]
+        compiled_max_batch = getattr(
+            model, "_trt_lm_max_batch_size", getattr(model, "_trt_lm_batch_size", None)
+        )
+        if runner is not None and compiled_max_batch is not None and total_bsz != int(compiled_max_batch):
+            raise ValueError(
+                f"TRT LM batch mismatch: compiled batch={compiled_max_batch}, runtime batch={total_bsz}. "
+                "Recompile TRT LM with matching batch (input_batch * num_traj_samples)."
+            )
+
+        # --- Repeat prompt across trajectory samples (interleaved per input) --
+        e_batch = inputs_embeds.repeat_interleave(num_traj_samples, dim=0).to(device, dtype)
+        vis_rep = vis_masks.repeat_interleave(num_traj_samples, dim=0).to(device)
+        pos_rep = position_ids_prefill.repeat_interleave(num_traj_samples, dim=1).to(device)
+        rope_rep = rope_deltas.to(device).repeat_interleave(num_traj_samples, dim=0)
+        S_input = int(e_batch.shape[1])
+
+        ds_list = None
+        if ds_embeds is not None and len(ds_embeds) > 0:
+            ds_list = []
+            for de in ds_embeds:
+                de = de.to(device, dtype)
+                v_per = de.shape[0] // B
+                de = de.view(B, v_per, de.shape[-1]).repeat_interleave(
+                    num_traj_samples, dim=0
+                ).reshape(total_bsz * v_per, de.shape[-1])
+                ds_list.append(de)
+
+        embed_tokens = model.vlm.model.language_model.embed_tokens
+        lm_head = model.vlm.get_output_embeddings()
+        lm_dtype = lm_head.weight.dtype
+
+        # --- Prefill (eager native model fills the static cache) --------------
+        hidden = runner.prefill(e_batch, pos_rep, vis_rep, ds_list)
+        logits = lm_head(hidden[:, -1:, :].to(lm_dtype))
+        next_token = sample_token(
+            logits, traj_off, traj_vocab, temperature=0.6, top_p=0.98
         )
 
-        vlm_outputs = model.vlm.generate(
-            input_ids=input_ids,
-            generation_config=model.vlm.generation_config,
-            stopping_criteria=stopping_criteria,
-            logits_processor=logits_processor,
-            **tokenized_data,
+        # --- Decode loop through the aliased TRT engine -----------------------
+        generated: list[list[int]] = [[int(t.item())] for t in next_token]
+        done = torch.zeros(total_bsz, dtype=torch.bool, device=device)
+        seen_eos = next_token.squeeze(-1) == eos_token_id
+        for _ in range(max_generation_length - 1):
+            if bool(done.all()):
+                break
+            step_embeds = embed_tokens(next_token.squeeze(-1)).to(device, dtype).unsqueeze(1)
+            hidden = runner.decode_step(step_embeds, rope_rep)
+            logits = lm_head(hidden.to(lm_dtype))
+            next_token = sample_token(
+                logits, traj_off, traj_vocab, temperature=0.6, top_p=0.98
+            )
+            newly_done = seen_eos & ~done
+            done = done | newly_done
+            for i in range(total_bsz):
+                if not bool(done[i]):
+                    generated[i].append(int(next_token[i].item()))
+            seen_eos = seen_eos | (next_token.squeeze(-1) == eos_token_id)
+
+        # --- Assemble full sequences (prompt + generated) ---------------------
+        max_gen_len = max((len(x) for x in generated), default=0)
+        gen_tokens = torch.full(
+            (total_bsz, max_gen_len), model.tokenizer.pad_token_id, dtype=torch.long, device=device
         )
-        vlm_outputs.rope_deltas = model.vlm.model.rope_deltas
-
-        if original_vision_forward is not None:
-            model.vlm.model.visual.forward = original_vision_forward
-
-        vlm_outputs.sequences = replace_padding_after_eos(
-            token_ids=vlm_outputs.sequences,
+        for i, ids in enumerate(generated):
+            if len(ids) > 0:
+                gen_tokens[i, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+        input_ids_rep = input_ids.to(device).repeat_interleave(num_traj_samples, dim=0)
+        sequences = replace_padding_after_eos(
+            token_ids=torch.cat([input_ids_rep, gen_tokens], dim=1),
             eos_token_id=eos_token_id,
             pad_token_id=model.tokenizer.pad_token_id,
         )
 
-        b_star = vlm_outputs.sequences.shape[0]
-        compiled_max_batch = getattr(
-            model,
-            "_trt_lm_max_batch_size",
-            getattr(model, "_trt_lm_batch_size", None),
-        )
-        if trt_lm is not None and compiled_max_batch is not None and int(b_star) > int(compiled_max_batch):
-            raise ValueError(
-                f"TRT LM batch mismatch: compiled max batch={compiled_max_batch}, runtime batch={b_star}. "
-                "Recompile TRT LM with a larger num_traj_samples/input batch."
-            )
-        traj_future_start_mask = vlm_outputs.sequences == eos_token_id
+        # --- Locate <traj_future_start> and build diffusion conditioning ------
+        b_star = total_bsz
+        traj_future_start_mask = sequences == eos_token_id
         has_traj_future_start = traj_future_start_mask.any(dim=1)
         traj_future_start_positions = traj_future_start_mask.int().argmax(dim=1)
-        last_token_positions = torch.full(
-            (b_star,), vlm_outputs.sequences.shape[1] - 1, device=device
-        )
+        last_token_positions = torch.full((b_star,), sequences.shape[1] - 1, device=device)
         valid_token_pos_id = torch.where(
             has_traj_future_start, traj_future_start_positions, last_token_positions
         )
         offset = valid_token_pos_id + 1
 
         n_diffusion_tokens = model.action_space.get_action_space_dims()[0]
-        prompt_cache = vlm_outputs.past_key_values
-        prefill_seq_len = prompt_cache.get_seq_length()
+        prefill_seq_len = int(runner.position)
 
         position_ids = torch.arange(n_diffusion_tokens, device=device)
         position_ids = einops.repeat(position_ids, "l -> 3 b l", b=b_star).clone()
-        delta = vlm_outputs.rope_deltas + offset[:, None]
+        delta = rope_rep + offset[:, None]
         position_ids = position_ids + delta.to(device)
 
         neg_inf = torch.finfo(dtype).min
@@ -488,12 +520,8 @@ def run_inference_trt(
         for i in range(b_star):
             attention_mask[i, :, :, offset[i] : -n_diffusion_tokens] = neg_inf
 
-        prefix_k, prefix_v = stack_prefix_kv_from_cache(
-            prompt_cache,
-            device=torch.device(device),
-            dtype=dtype,
-        )
-        # Defensive cast to guarantee TRT KV input dtypes stay aligned.
+        # --- KV handoff to the diffusion expert from the static cache ---------
+        prefix_k, prefix_v = stack_static_kv(runner.prefill_cache, prefill_seq_len)
         prefix_k = prefix_k.to(device=device, dtype=dtype).contiguous()
         prefix_v = prefix_v.to(device=device, dtype=dtype).contiguous()
         prompt_cache = PrefixKVCache(prefix_k, prefix_v)
@@ -566,9 +594,9 @@ def run_inference_trt(
             pred_rot, "(b ns nj) ... -> b ns nj ...", ns=1, nj=num_traj_samples
         )
 
-        extra = extract_text_tokens(model.tokenizer, vlm_outputs.sequences)
+        extra = extract_text_tokens(model.tokenizer, sequences)
         for k in extra:
-            extra[k] = np.array(extra[k]).reshape([input_ids.shape[0], 1, num_traj_samples])
+            extra[k] = np.array(extra[k]).reshape([B, 1, num_traj_samples])
 
     inference_time = time.perf_counter() - start_time
     return pred_xyz, pred_rot, extra, inference_time

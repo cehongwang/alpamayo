@@ -13,6 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Read-only stacked KV cache used by the TRT diffusion expert.
+
+The autoregressive LM decode now uses the HuggingFace ``StaticCache`` path in
+``static_cache_lm.py`` (fixed-size buffers + Torch-TensorRT aliased I/O), so the
+former growing ``PrefixKVCache`` decode machinery has been removed.
+
+``PrefixKVCache`` is retained here only as a lightweight ``Cache``-compatible
+adapter so the diffusion expert can attend over the prompt KV passed as stacked
+``[L, B, H, S, D]`` tensors (it is not TRT-exportable as a ``Cache`` object).
+See ``trt/diffusion.py``.
+"""
+
 from __future__ import annotations
 
 import torch
@@ -218,141 +230,3 @@ class PrefixKVCache:
 
     def __getitem__(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         return self.layers[layer_idx].keys, self.layers[layer_idx].values
-
-
-def stack_prefix_kv_from_cache(
-    past_key_values,
-    *,
-    device: torch.device | None = None,
-    dtype: torch.dtype | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Convert a fully-initialized cache object into stacked [L, B, H, S, D] tensors.
-    """
-    if isinstance(past_key_values, PrefixKVCache):
-        return (
-            maybe_to(past_key_values.key_cache, device=device, dtype=dtype),
-            maybe_to(past_key_values.value_cache, device=device, dtype=dtype),
-        )
-
-    if isinstance(past_key_values, tuple) and len(past_key_values) == 2:
-        if past_key_values[0] is None or past_key_values[1] is None:
-            raise ValueError("Expected concrete stacked KV tensors; got (None, None)")
-        return (
-            maybe_to(past_key_values[0], device=device, dtype=dtype),
-            maybe_to(past_key_values[1], device=device, dtype=dtype),
-        )
-
-    if hasattr(past_key_values, "layers"):
-        layers = list(past_key_values.layers)
-        if len(layers) == 0:
-            raise ValueError("Cache has no initialized layers")
-        k_tensors = [getattr(layer, "keys", None) for layer in layers]
-        v_tensors = [getattr(layer, "values", None) for layer in layers]
-        if any((k is None) != (v is None) for k, v in zip(k_tensors, v_tensors)):
-            raise ValueError("Inconsistent cache state: one of keys/values is None")
-        if any(k is None for k in k_tensors):
-            raise ValueError("Cache contains uninitialized layers; cannot infer stacked tensors")
-        return (
-            torch.stack([maybe_to(k, device=device, dtype=dtype) for k in k_tensors], dim=0),
-            torch.stack([maybe_to(v, device=device, dtype=dtype) for v in v_tensors], dim=0),
-        )
-
-    raise ValueError("Unsupported cache type for stack_prefix_kv_from_cache")
-
-
-def extract_stacked_kv_from_cache(
-    past_key_values,
-    *,
-    num_layers: int,
-    batch_size: int,
-    num_kv_heads: int,
-    head_dim: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert HF cache object to stacked [L, B, H, S, D] tensors."""
-
-    def _empty_cache() -> tuple[torch.Tensor, torch.Tensor]:
-        empty = torch.zeros(
-            num_layers,
-            batch_size,
-            num_kv_heads,
-            0,
-            head_dim,
-            dtype=dtype,
-            device=device,
-        )
-        return empty, torch.zeros_like(empty)
-
-    if isinstance(past_key_values, PrefixKVCache):
-        return (
-            maybe_to(past_key_values.key_cache, device=device, dtype=dtype),
-            maybe_to(past_key_values.value_cache, device=device, dtype=dtype),
-        )
-
-    if isinstance(past_key_values, tuple) and len(past_key_values) == 2:
-        if past_key_values[0] is None or past_key_values[1] is None:
-            return _empty_cache()
-        return (
-            maybe_to(past_key_values[0], device=device, dtype=dtype),
-            maybe_to(past_key_values[1], device=device, dtype=dtype),
-        )
-
-    if past_key_values is None or (
-        hasattr(past_key_values, "layers") and len(getattr(past_key_values, "layers")) == 0
-    ):
-        return _empty_cache()
-
-    if hasattr(past_key_values, "layers"):
-        layers = list(past_key_values.layers)
-        layer_k: list[torch.Tensor | None] = []
-        layer_v: list[torch.Tensor | None] = []
-        any_initialized = False
-        for idx in range(num_layers):
-            if idx >= len(layers):
-                layer_k.append(None)
-                layer_v.append(None)
-                continue
-            k = getattr(layers[idx], "keys", None)
-            v = getattr(layers[idx], "values", None)
-            if (k is None) != (v is None):
-                raise ValueError(f"Inconsistent cache state at layer {idx}: one of keys/values is None")
-            if k is not None:
-                any_initialized = True
-            layer_k.append(k)
-            layer_v.append(v)
-
-        if not any_initialized:
-            return _empty_cache()
-
-        first_k = next(k for k in layer_k if k is not None)
-        prefix_len = int(first_k.shape[-2])
-        filled_k: list[torch.Tensor] = []
-        filled_v: list[torch.Tensor] = []
-        for idx, (k, v) in enumerate(zip(layer_k, layer_v)):
-            if k is None:
-                k = torch.zeros(
-                    batch_size,
-                    num_kv_heads,
-                    prefix_len,
-                    head_dim,
-                    dtype=dtype,
-                    device=device,
-                )
-                v = torch.zeros_like(k)
-            else:
-                if int(k.shape[-2]) != prefix_len:
-                    raise ValueError(
-                        "Cache sequence length mismatch across layers; "
-                        f"layer0={prefix_len}, layer{idx}={int(k.shape[-2])}"
-                    )
-                k = maybe_to(k, device=device, dtype=dtype)
-                v = maybe_to(v, device=device, dtype=dtype)
-            filled_k.append(k)
-            filled_v.append(v)
-        return torch.stack(filled_k, dim=0), torch.stack(filled_v, dim=0)
-
-    raise ValueError(
-        "past_key_values must be None, (prefix_k, prefix_v), PrefixKVCache, or an object with .layers"
-    )
