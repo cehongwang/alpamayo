@@ -204,7 +204,7 @@ class ReasoningVLAConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vlm_name_or_path: str = "Qwen/Qwen3-VL-8B-Instruct",
+        vlm_name_or_path: str = "Qwen/Qwen3-VL-2B-Instruct",
         vlm_backend: str = "qwenvl3",
         traj_tokenizer_cfg: dict[str, Any] | None = None,
         hist_traj_tokenizer_cfg: dict[str, Any] | None = None,
@@ -445,6 +445,24 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
         Accepts ``*args, **kwargs`` because transformers>=5.3 passes new
         kwargs like ``recompute_mapping`` from ``init_weights``; those are
         only meaningful to the base HF model, so we forward them through.
+
+        ``missing_keys`` (when passed from ``_finalize_model_loading``)
+        contains parameter paths relative to the *outer* model (e.g.
+        ``"vlm.lm_head.weight"``), but ``self.vlm.tie_weights`` reasons
+        about its own parameter namespace (``"lm_head.weight"``).
+        Without the prefix strip below, HF wrongly concludes that a
+        missing param "is there", takes the both-present branch in
+        ``modeling_utils.tie_weights`` and calls ``torch.equal`` on a
+        meta-device tensor — which raises
+        ``NotImplementedError: aten::equal: ... Meta tensors``.
         """
+        missing_keys = kwargs.get("missing_keys")
+        if missing_keys is not None:
+            prefix = "vlm."
+            stripped = type(missing_keys)(
+                k[len(prefix):] if k.startswith(prefix) else k for k in missing_keys
+            )
+            kwargs = {**kwargs, "missing_keys": stripped}
+
         if hasattr(self.vlm, "tie_weights"):
             self.vlm.tie_weights(*args, **kwargs)

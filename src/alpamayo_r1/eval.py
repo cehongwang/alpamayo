@@ -5,7 +5,9 @@
 import argparse
 import gc
 import json
+import logging
 import math
+import os
 import time
 from pathlib import Path
 
@@ -13,6 +15,15 @@ import pandas as pd
 
 import torch
 import numpy as np
+from tqdm import tqdm
+
+# `httpx` and `huggingface_hub` log every byte-range request at INFO level.
+# With the dataset streamer issuing hundreds of `Range: bytes=...` GETs per
+# clip (one per camera/frame), that drowns the tqdm progress bar and any
+# real diagnostics.  Demote them to WARNING — full HTTP traces are still
+# available by setting `HTTPX_LOG_LEVEL=info` in the env.
+for _noisy in ("httpx", "huggingface_hub", "urllib3"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
@@ -66,6 +77,127 @@ def read_clip_ids_from_parquet(parquet_path: str) -> list[str]:
             seen.add(cid)
             uniq.append(cid)
     return uniq
+
+
+def make_joint_calibration_forward_loop(
+    *,
+    clip_ids: list[str],
+    processor,
+    t0_us: int,
+    top_p: float,
+    temperature: float,
+    max_generation_length: int,
+    calibration_traj_samples: int,
+    device: str,
+):
+    """
+    Build a calibration loop that exercises both VLM generation and diffusion.
+
+    This avoids text-only calibration and ensures quantizers in the rollout path
+    (vlm/expert/diffusion-related modules) observe representative activations.
+    """
+    def _calibration_loop(runtime_model):
+        runtime_model.eval()
+        with torch.no_grad():
+            for clip_id in tqdm(clip_ids, desc="calibration"):
+                data = load_physical_aiavdataset(clip_id, t0_us=t0_us)
+                messages = helper.create_message(data["image_frames"].flatten(0, 1))
+                inputs = processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    continue_final_message=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
+                model_inputs = {
+                    "tokenized_data": inputs,
+                    "ego_history_xyz": data["ego_history_xyz"],
+                    "ego_history_rot": data["ego_history_rot"],
+                }
+                model_inputs = helper.to_device(model_inputs, device)
+
+                with torch.autocast("cuda", dtype=torch.float16):
+                    runtime_model.sample_trajectories_from_data_with_vlm_rollout(
+                        data=model_inputs,
+                        top_p=top_p,
+                        temperature=temperature,
+                        num_traj_samples=calibration_traj_samples,
+                        max_generation_length=max_generation_length,
+                    )
+
+    return _calibration_loop
+
+
+def print_modelopt_quant_layer_summary(model):
+    """Print enabled/disabled ModelOpt quantizers grouped by owning module."""
+    from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+
+    def _is_enabled(quantizer: TensorQuantizer) -> bool:
+        is_enabled = getattr(quantizer, "is_enabled", None)
+        if callable(is_enabled):
+            return bool(is_enabled())
+        if is_enabled is not None:
+            return bool(is_enabled)
+
+        disabled = getattr(quantizer, "disabled", None)
+        if disabled is not None:
+            return not bool(disabled)
+
+        disabled = getattr(quantizer, "_disabled", None)
+        if disabled is not None:
+            return not bool(disabled)
+
+        return "disabled" not in repr(quantizer)
+
+    quantizers_by_layer = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, TensorQuantizer):
+            continue
+
+        layer_name, _, quantizer_name = name.rpartition(".")
+        layer_name = layer_name or "<root>"
+        quantizers_by_layer.setdefault(layer_name, []).append(
+            (quantizer_name, _is_enabled(module))
+        )
+
+    quantized_layers = []
+    unquantized_layers = []
+    enabled_quantizers = 0
+    disabled_quantizers = 0
+
+    for layer_name, quantizers in sorted(quantizers_by_layer.items()):
+        num_enabled = sum(enabled for _, enabled in quantizers)
+        enabled_quantizers += num_enabled
+        disabled_quantizers += len(quantizers) - num_enabled
+        if num_enabled > 0:
+            quantized_layers.append((layer_name, quantizers))
+        else:
+            unquantized_layers.append((layer_name, quantizers))
+
+    print("================== ModelOpt quantized layer summary ==================")
+    print(
+        f"Layers with ModelOpt quantizers: {len(quantizers_by_layer)} "
+        f"(quantized: {len(quantized_layers)}, not quantized: {len(unquantized_layers)})"
+    )
+    print(
+        f"Quantizers: {enabled_quantizers + disabled_quantizers} "
+        f"(enabled: {enabled_quantizers}, disabled: {disabled_quantizers})"
+    )
+
+    print("\nQuantized layers:")
+    for layer_name, quantizers in quantized_layers:
+        enabled_names = [name for name, enabled in quantizers if enabled]
+        disabled_names = [name for name, enabled in quantizers if not enabled]
+        print(
+            f"  {layer_name}: enabled={enabled_names}"
+            f"{', disabled=' + str(disabled_names) if disabled_names else ''}"
+        )
+
+    print("\nNot quantized layers with ModelOpt quantizers:")
+    for layer_name, quantizers in unquantized_layers:
+        quantizer_names = [name for name, _ in quantizers]
+        print(f"  {layer_name}: disabled={quantizer_names}")
 
 
 @torch.inference_mode()
@@ -221,6 +353,44 @@ def main():
         default=0,
         help="Override max_prefix_len for TRT compile (0 = use observed prefix_seq_len).",
     )
+    ap.add_argument(
+        "--quant_format",
+        type=str,
+        default=None,
+        choices=["fp8", "nvfp4", "w4a8_nvfp4_fp8", "auto"],
+        help="Jointly quantize the entire pytorch model to the specified format before running evaluation.",
+    )
+    ap.add_argument(
+        "--auto_quantize_bits",
+        type=float,
+        default=4.8,
+        help="Effective-bits budget for AutoQuantize (only used when --quant_format auto).",
+    )
+    ap.add_argument("--quant_algo", type=str, default="max", choices=["max", "smoothquant"])
+    ap.add_argument(
+        "--quant_weight_only",
+        action="store_true",
+        help="Jointly quantize the entire pytorch model to weight-only before running evaluation.",
+    )
+    ap.add_argument(
+        "--calib_parquet",
+        type=str,
+        default="0417_5k_train_set_for_calibration_25.10.parquet",
+        help="Parquet (relative to this script) listing calibration clip_ids.",
+    )
+    ap.add_argument("--num_of_calib_clips", type=int, default=100)
+    ap.add_argument(
+        "--quantized_ckpt",
+        action="store_true",
+        help="Treat --ckpt as an already-quantized ModelOpt checkpoint: restore "
+        "and summarize quantizers instead of re-quantizing.",
+    )
+    ap.add_argument(
+        "--save_model_dir",
+        type=str,
+        default=None,
+        help="Directory to save the quantized model.",
+    )
     args = ap.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -235,6 +405,19 @@ def main():
     device = "cuda"
     ckpt_path = args.ckpt
     print(f"Loading checkpoint from: {ckpt_path}")
+
+    # Enable automatic ModelOpt save/restore with the HF checkpointing APIs.
+    # This must run before from_pretrained so a previously-quantized checkpoint
+    # restores its quantizer state; it also enables save_pretrained() below.
+    import modelopt.torch.opt as mto
+
+    mto.enable_huggingface_checkpointing()
+
+    # `--quantized_ckpt` marks the checkpoint as already quantized: skip
+    # re-quantization and just restore + summarize its quantizer state.
+    # Otherwise any checkpoint (Hub id or local fp16 path) is quantized when
+    # `--quant_format` is set.
+    customized_model = args.quantized_ckpt
     model = AlpamayoR1.from_pretrained(
         str(ckpt_path),
         dtype=torch.float16,
@@ -242,6 +425,81 @@ def main():
         device=device, dtype=torch.float16
     )
     model.eval()
+    if customized_model:
+        import modelopt.torch.quantization as mtq
+
+        mtq.print_quant_summary(model)
+
+    # IMPORTANT: build processor once (do NOT rebuild per clip)
+    processor = helper.get_processor(model.tokenizer)
+
+    if args.quant_format is not None and not customized_model:
+        assert args.calib_parquet is not None, "--calib_parquet is required when quant_format is not None"
+        assert 0 < args.num_of_calib_clips <= 5000, "--num_of_calib_clips must be between 1 and 5000"
+        calib_parquet_path = (script_dir / args.calib_parquet).resolve()
+        calib_clip_ids = read_clip_ids_from_parquet(str(calib_parquet_path))
+        calib_clip_ids = calib_clip_ids[: args.num_of_calib_clips]
+        print(f"Loaded {len(calib_clip_ids)} calibration clip_ids from: {calib_parquet_path}")
+
+        from alpamayo_r1.trt.quantize_utils import auto_quantize_model, quantize_model
+
+        print(f"Quantizing model ({args.quant_format}) ...")
+
+        quantization_args = argparse.Namespace(
+            quant_format=args.quant_format,
+            quant_algo=args.quant_algo,
+            weight_only=args.quant_weight_only,
+            debug=True,
+            auto_quantize_bits=args.auto_quantize_bits,
+        )
+        calibration_forward_loop = make_joint_calibration_forward_loop(
+            clip_ids=calib_clip_ids,
+            processor=processor,
+            t0_us=args.t0_us,
+            top_p=args.top_p,
+            temperature=args.temperature,
+            max_generation_length=args.max_generation_length,
+            calibration_traj_samples=args.num_traj_samples,
+            device=device,
+        )
+
+        if args.quant_format == "auto":
+            with torch.enable_grad():
+                model = auto_quantize_model(
+                    model,
+                    quantization_args,
+                    clip_ids=calib_clip_ids,
+                    processor=processor,
+                    t0_us=args.t0_us,
+                    top_p=args.top_p,
+                    temperature=args.temperature,
+                    max_generation_length=args.max_generation_length,
+                    calibration_traj_samples=args.num_traj_samples,
+                    device=device,
+                )
+        else:
+            model = quantize_model(
+                model,
+                quantization_args,
+                calibration_forward_loop=calibration_forward_loop,
+            )
+        model.eval()
+
+        print_modelopt_quant_layer_summary(model)
+
+        if args.save_model_dir is not None:
+            save_dir = os.path.join(
+                args.save_model_dir,
+                f"alpamayo_r1_{args.quant_format}"
+                f"{'_' + str(args.auto_quantize_bits) + 'bits' if args.quant_format == 'auto' else ''}"
+                f"{'_weight_only' if args.quant_weight_only else ''}"
+                f"_calib{args.num_of_calib_clips}",
+            )
+            os.makedirs(save_dir, exist_ok=True)
+            print(f"Saving quantized model to: {save_dir}")
+            model.save_pretrained(save_dir)
+            print(f"Quantized model saved to: {save_dir}")
+
     seed = None if args.seed < 0 else args.seed
 
     trt_vision = None
@@ -279,15 +537,7 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # IMPORTANT: build processor once (do NOT rebuild per clip)
-    processor = helper.get_processor(model.tokenizer)
-
-    # Optional: tqdm progress if available
-    try:
-        from tqdm import tqdm
-        it = tqdm(clip_ids, desc="Evaluating clips")
-    except Exception:
-        it = clip_ids
+    it = tqdm(clip_ids, desc="Evaluating clips")
 
     per_clip = []
     per_clip_ms = []
@@ -295,7 +545,7 @@ def main():
 
     for i, clip_id in enumerate(it, start=1):
 
-        # if i > 20: break
+        # if i > 5: break
         try:
             if args.compile_trt:
                 minade, elapsed_ms = compute_minade_for_clip_trt(
