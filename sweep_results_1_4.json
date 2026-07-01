@@ -1,0 +1,33 @@
+{
+  "config": {
+    "limit": 20,
+    "seed": 42,
+    "ckpt": "/home/trt-edgellm-alpamayo/tensorrt-edgellm-workspace/Alpamayo-R1-10B"
+  },
+  "results": {
+    "1": {
+      "avg_minADE_m": 1.3438233613967896,
+      "avg_ms_per_clip": 1731.015663901053,
+      "n_ok": 20,
+      "n_total": 20
+    },
+    "2": {
+      "avg_minADE_m": 1.1089624792337418,
+      "avg_ms_per_clip": 1688.2206532987766,
+      "n_ok": 20,
+      "n_total": 20
+    },
+    "3": {
+      "avg_minADE_m": 1.0413120865821839,
+      "avg_ms_per_clip": 1706.9688755480456,
+      "n_ok": 20,
+      "n_total": 20
+    },
+    "4": {
+      "avg_minADE_m": 0.9939683988690377,
+      "avg_ms_per_clip": 1753.1328835422755,
+      "n_ok": 20,
+      "n_total": 20
+    }
+  }
+}

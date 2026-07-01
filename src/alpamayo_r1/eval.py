@@ -68,6 +68,22 @@ def read_clip_ids_from_parquet(parquet_path: str) -> list[str]:
     return uniq
 
 
+def _reasoning_from_extra(extra: dict) -> dict[str, str]:
+    """Pull the (deterministic under greedy) reasoning text out of the extra dict.
+
+    Values are arrays of shape [B, num_traj_sets, num_traj_samples]; we take the
+    first sample since all samples share the same VLM rollout under greedy decode.
+    """
+    out: dict[str, str] = {}
+    for key in ("cot", "meta_action", "answer"):
+        if key not in extra:
+            out[key] = ""
+            continue
+        val = np.asarray(extra[key]).reshape(-1)
+        out[key] = str(val[0]) if val.size else ""
+    return out
+
+
 @torch.inference_mode()
 def compute_minade_for_clip_pytorch(
     model: AlpamayoR1,
@@ -80,9 +96,13 @@ def compute_minade_for_clip_pytorch(
     max_generation_length: int,
     device: str = "cuda",
     seed: int | None = 42,
-) -> tuple[float, float]:
+    top_k: int | None = None,
+) -> tuple[float, float, dict]:
     """
-    Returns minADE (meters) for one clip.
+    Returns (minADE in meters, elapsed_ms, details) for one clip.
+
+    ``details`` carries the reasoning text and the best-sample predicted XY
+    trajectory so an eager run can later be compared against a TRT run.
     """
     data = load_physical_aiavdataset(clip_id, t0_us=t0_us)
 
@@ -115,6 +135,7 @@ def compute_minade_for_clip_pytorch(
             data=model_inputs,
             top_p=top_p,
             temperature=temperature,
+            top_k=top_k,
             num_traj_samples=num_traj_samples,
             max_generation_length=max_generation_length,
             return_extra=True,
@@ -130,8 +151,13 @@ def compute_minade_for_clip_pytorch(
     # ADE per sample: mean over time of L2 in XY
     d = np.linalg.norm(pred_xy - gt_xy[None, :, :], axis=-1)  # (S,T)
     ade = d.mean(axis=-1)  # (S,)
-    min_ade = float(ade.min())
-    return min_ade, elapsed_ms
+    best = int(ade.argmin())
+    min_ade = float(ade[best])
+    details = {
+        "reasoning": _reasoning_from_extra(extra),
+        "best_pred_xy": pred_xy[best].tolist(),  # (T,2)
+    }
+    return min_ade, elapsed_ms, details
 
 
 @torch.inference_mode()
@@ -146,12 +172,12 @@ def compute_minade_for_clip_trt(
     trt_diffusion,
     device: str = "cuda",
     seed: int | None = 42,
-) -> tuple[float, float]:
+) -> tuple[float, float, dict]:
     data = load_physical_aiavdataset(clip_id, t0_us=t0_us)
     messages = helper.create_message(data["image_frames"].flatten(0, 1))
     create_inputs_fn = prepare_model_inputs(model, data, messages, device=device)
     seed = 42 if seed is None else seed
-    pred_xyz, _, _, elapsed_sec = run_inference_trt(
+    pred_xyz, _, extra, elapsed_sec = run_inference_trt(
         model,
         create_inputs_fn,
         trt_vision=trt_vision,
@@ -166,7 +192,99 @@ def compute_minade_for_clip_trt(
     pred_xy = pred_xyz.detach().cpu().numpy()[0, 0, :, :, :2]  # (S,T,2)
     d = np.linalg.norm(pred_xy - gt_xy[None, :, :], axis=-1)  # (S,T)
     ade = d.mean(axis=-1)  # (S,)
-    return float(ade.min()), elapsed_sec * 1000.0
+    best = int(ade.argmin())
+    details = {
+        "reasoning": _reasoning_from_extra(extra),
+        "best_pred_xy": pred_xy[best].tolist(),  # (T,2)
+    }
+    return float(ade[best]), elapsed_sec * 1000.0, details
+
+
+def _token_prefix_agreement(a: str, b: str) -> float:
+    """Fraction of leading whitespace-tokens that match between two strings."""
+    ta, tb = a.split(), b.split()
+    if not ta and not tb:
+        return 1.0
+    if not ta or not tb:
+        return 0.0
+    matched = 0
+    for x, y in zip(ta, tb):
+        if x != y:
+            break
+        matched += 1
+    return matched / max(len(ta), len(tb))
+
+
+def compare_results(eager_path: str, trt_path: str) -> dict:
+    """Compute eager-vs-optimized parity metrics from two saved result files.
+
+    Both files are expected to be produced by this script's ``--save_results``
+    output (ideally with ``--greedy`` so the VLM rollout is deterministic).
+    """
+    from difflib import SequenceMatcher
+
+    with open(eager_path) as f:
+        eager = {r["clip_id"]: r for r in json.load(f)["results"]}
+    with open(trt_path) as f:
+        trt = {r["clip_id"]: r for r in json.load(f)["results"]}
+
+    common = [c for c in eager if c in trt]
+    if not common:
+        raise ValueError("No overlapping clip_ids between the two result files.")
+
+    # Per-field exact-match tallies, counted only over clips where at least one
+    # side emitted the field. A field that neither run produces (e.g. this
+    # checkpoint never emits meta_action/answer) would otherwise score a
+    # misleading "" == "" == 1.0, so it is reported as N/A instead.
+    text_match = {"cot": 0, "meta_action": 0, "answer": 0}
+    text_eval_n = {"cot": 0, "meta_action": 0, "answer": 0}
+    cot_prefix_sum = cot_sim_sum = 0.0
+    cot_prefix_n = 0
+    traj_l2_sum = minade_abs_sum = 0.0
+    traj_count = 0
+
+    for cid in common:
+        re_, rt = eager[cid]["reasoning"], trt[cid]["reasoning"]
+        for field in text_match:
+            se, st = re_.get(field, ""), rt.get(field, "")
+            if not se and not st:
+                continue  # neither run produced this field; skip, don't score
+            text_eval_n[field] += 1
+            text_match[field] += int(se == st)
+
+        ce, ct = re_.get("cot", ""), rt.get("cot", "")
+        if ce or ct:
+            cot_prefix_sum += _token_prefix_agreement(ce, ct)
+            cot_sim_sum += SequenceMatcher(None, ce, ct).ratio()
+            cot_prefix_n += 1
+
+        minade_abs_sum += abs(eager[cid]["minade"] - trt[cid]["minade"])
+        xe, xt = eager[cid].get("best_pred_xy"), trt[cid].get("best_pred_xy")
+        if xe is not None and xt is not None:
+            xe, xt = np.asarray(xe), np.asarray(xt)
+            if xe.shape == xt.shape:
+                traj_l2_sum += float(np.linalg.norm(xe - xt, axis=-1).mean())
+                traj_count += 1
+
+    n = len(common)
+
+    def _rate(field: str) -> float | None:
+        d = text_eval_n[field]
+        return (text_match[field] / d) if d else None
+
+    return {
+        "num_compared": n,
+        "meta_action_exact_match_rate": _rate("meta_action"),
+        "meta_action_num_evaluated": text_eval_n["meta_action"],
+        "answer_exact_match_rate": _rate("answer"),
+        "answer_num_evaluated": text_eval_n["answer"],
+        "cot_exact_match_rate": _rate("cot"),
+        "cot_num_evaluated": text_eval_n["cot"],
+        "cot_token_prefix_agreement": (cot_prefix_sum / cot_prefix_n) if cot_prefix_n else None,
+        "cot_string_similarity": (cot_sim_sum / cot_prefix_n) if cot_prefix_n else None,
+        "mean_abs_minade_delta_m": minade_abs_sum / n,
+        "mean_best_traj_l2_m": (traj_l2_sum / traj_count) if traj_count else None,
+    }
 
 
 def main():
@@ -184,6 +302,26 @@ def main():
     ap.add_argument("--max_generation_length", type=int, default=256)
     ap.add_argument("--top_p", type=float, default=0.98)
     ap.add_argument("--temperature", type=float, default=0.6)
+    ap.add_argument(
+        "--greedy",
+        action="store_true",
+        help="Deterministic argmax (top_k=1) VLM decode for reproducible reasoning text. "
+        "Combine with --seed for eager-vs-TRT parity comparison.",
+    )
+    ap.add_argument(
+        "--save_results",
+        type=str,
+        default=None,
+        help="Path to write per-clip JSON (minADE + reasoning text + best trajectory).",
+    )
+    ap.add_argument(
+        "--compare",
+        type=str,
+        nargs=2,
+        metavar=("EAGER_JSON", "TRT_JSON"),
+        default=None,
+        help="Compare two saved result files for eager-vs-optimized parity, then exit.",
+    )
     ap.add_argument("--limit", type=int, default=644, help="How many unique clip_ids to evaluate.")
     ap.add_argument("--seed", type=int, default=42, help="Set -1 to disable reseeding per clip.")
     ap.add_argument("--print_every", type=int, default=25)
@@ -223,6 +361,15 @@ def main():
     )
     args = ap.parse_args()
 
+    if args.compare is not None:
+        metrics = compare_results(args.compare[0], args.compare[1])
+        print("============================================================")
+        print("Eager-vs-optimized parity")
+        print("============================================================")
+        for k, v in metrics.items():
+            print(f"  {k}: {v}")
+        return
+
     script_dir = Path(__file__).resolve().parent
     parquet_path = (script_dir / args.parquet).resolve()
 
@@ -241,6 +388,9 @@ def main():
     ).to(
         device=device, dtype=torch.float16
     )
+    # The diffusion expert uses a custom 4D float additive attention mask that is
+    # incompatible with flash-attention's unpadding path; force sdpa like the TRT paths.
+    model.expert.config._attn_implementation = "sdpa"
     model.eval()
     seed = None if args.seed < 0 else args.seed
 
@@ -292,13 +442,19 @@ def main():
     per_clip = []
     per_clip_ms = []
     failed = []
+    results = []
+
+    # top_k=1 turns the existing multinomial decode into deterministic argmax.
+    top_k = 1 if args.greedy else None
+    if args.greedy:
+        print("Greedy decode enabled (top_k=1): VLM reasoning text is deterministic per seed.")
 
     for i, clip_id in enumerate(it, start=1):
 
         # if i > 20: break
         try:
             if args.compile_trt:
-                minade, elapsed_ms = compute_minade_for_clip_trt(
+                minade, elapsed_ms, details = compute_minade_for_clip_trt(
                     model=model,
                     clip_id=clip_id,
                     t0_us=args.t0_us,
@@ -311,7 +467,7 @@ def main():
                     seed=seed,
                 )
             else:
-                minade, elapsed_ms = compute_minade_for_clip_pytorch(
+                minade, elapsed_ms, details = compute_minade_for_clip_pytorch(
                     model=model,
                     processor=processor,
                     clip_id=clip_id,
@@ -322,9 +478,19 @@ def main():
                     max_generation_length=args.max_generation_length,
                     device=device,
                     seed=seed,
+                    top_k=top_k,
                 )
             per_clip.append(minade)
             per_clip_ms.append(elapsed_ms)
+            if args.save_results:
+                results.append(
+                    {
+                        "clip_id": clip_id,
+                        "minade": minade,
+                        "reasoning": details["reasoning"],
+                        "best_pred_xy": details["best_pred_xy"],
+                    }
+                )
 
             if args.print_every and (i % args.print_every == 0):
                 avg_so_far = float(np.mean(per_clip)) if per_clip else math.nan
@@ -368,6 +534,23 @@ def main():
             print(f"  {cid}: {err}")
         if len(failed) > 10:
             print("  ...")
+
+    if args.save_results:
+        out_path = Path(args.save_results)
+        payload = {
+            "meta": {
+                "path": "trt" if args.compile_trt else "eager",
+                "greedy": bool(args.greedy),
+                "seed": seed,
+                "num_traj_samples": args.num_traj_samples,
+                "max_generation_length": args.max_generation_length,
+                "avg_minade": float(np.mean(per_clip)) if per_clip else None,
+            },
+            "results": results,
+        }
+        with out_path.open("w") as f:
+            json.dump(payload, f)
+        print(f"Saved {len(results)} per-clip results to: {out_path}")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@
 
 import copy
 import logging
+import os
 from typing import Any
 
 import einops
@@ -295,6 +296,7 @@ class AlpamayoR1(ReasoningVLA):
             step_fn=step_fn,
             device=device,
             return_all_steps=False,
+            inference_step=int(os.environ.get("AR1_INFERENCE_STEP", "10")),
             **diffusion_kwargs,
         )
 
